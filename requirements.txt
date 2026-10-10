@@ -1,0 +1,7 @@
+pyrogram
+tgcrypto
+pymongo
+google-genai
+qrcode
+pycountry
+aiohttp
