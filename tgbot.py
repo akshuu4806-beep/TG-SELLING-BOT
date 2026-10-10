@@ -1986,7 +1986,6 @@ async def handle_photo(client: Client, message: Message):
         await message.reply_text(customer_text, reply_markup=keyboard)
 
 from aiohttp import web
-import os
 
 async def handle(request):
     return web.Response(text="Bot is running!")
@@ -1996,9 +1995,13 @@ async def web_server():
     app.add_routes([web.get("/", handle)])
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Render automatically PORT environment variable deta hai
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Web server started and bound to port {port}")
+    print(f"Web server started on port {port}")
+
+if __name__ == "__main__":
+    print("Bot started with MongoDB persistence...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(web_server())
+    bot.run()
