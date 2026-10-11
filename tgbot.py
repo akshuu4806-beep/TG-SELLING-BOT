@@ -1601,10 +1601,18 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
                 f"👑 **Approved By:** {callback.from_user.mention}"
             )
+            
+            # 1. Payment Verification Group par bhejna
             try:
                 await bot.send_message(PAYMENT_LOG_GROUP, group_approve_msg)
             except Exception as e:
-                print(f"Failed to send approval to group: {e}")
+                print(f"Failed to send approval to payment group: {e}")
+
+            # 2. Purchase Successful / OTP Group par bhi bhejna
+            try:
+                await bot.send_message(OTP_GROUP_ID, group_approve_msg)
+            except Exception as e:
+                print(f"Failed to send approval to OTP group: {e}")
 
         else:
             # Status update deposit record me (Rejected)
@@ -1650,11 +1658,19 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
                 f"👑 **Rejected By:** {callback.from_user.mention}"
             )
+            
+            # 1. Payment Verification Group par bhejna
             try:
                 await bot.send_message(PAYMENT_LOG_GROUP, group_reject_msg)
             except Exception as e:
-                print(f"Failed to send rejection to group: {e}")
+                print(f"Failed to send rejection to payment group: {e}")
 
+            # 2. Purchase Successful / OTP Group par bhi bhejna
+            try:
+                await bot.send_message(OTP_GROUP_ID, group_reject_msg)
+            except Exception as e:
+                print(f"Failed to send rejection to OTP group: {e}")
+                
 # ================= MESSAGE HANDLER =================
 @bot.on_message(filters.text & ~filters.command(["start", "add", "addbulk", "broadcast", "gcast"]))
 async def handle_text(client: Client, message: Message):
