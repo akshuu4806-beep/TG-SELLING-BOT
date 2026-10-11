@@ -1168,13 +1168,20 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 )
                 return
 
-        # 4. Receiver UPI ID Match Check (Optional/Strict check agar receiver extract ho)
+        # 4. Receiver UPI ID Match Check (Strict Check)
         if ss_receiver and UPI_ID:
-            clean_ss_recv = re.sub(r'[\s@]', '', str(ss_receiver)).lower()
-            clean_bot_upi = re.sub(r'[\s@]', '', str(UPI_ID)).lower()
-            if clean_bot_upi not in clean_ss_recv and clean_ss_recv not in clean_bot_upi:
-                # Agar receiver match nahi hota toh warning ya manual verify par bhej sakte hain
-                print(f"Warning: SS Receiver '{ss_receiver}' did not strictly match Bot UPI '{UPI_ID}'")
+            clean_ss_recv = re.sub(r'[\s@._-]', '', str(ss_receiver)).lower()
+            clean_bot_upi = re.sub(r'[\s@._-]', '', str(UPI_ID)).lower()
+            
+            # Agar bot ka UPI ya UPI ka pehla hissa (handle) match nahi hota hai
+            bot_handle = clean_bot_upi.split()[0] if clean_bot_upi else ""
+            if clean_bot_upi not in clean_ss_recv and clean_ss_recv not in clean_bot_upi and bot_handle not in clean_ss_recv:
+                state["state"] = "awaiting_deposit_ss"
+                await msg_wait.edit_text(
+                    f"❌ **Wrong Receiver UPI!** Yeh payment kisi aur ke UPI (`{ss_receiver}`) par bheja gaya hai, hamare UPI par nahi.\n\n"
+                    "👉 **Kripya sahi UPI par payment karke uska naya screenshot send karein:**"
+                )
+                return
 
         # 5. Duplicate Transaction Check
         existing_txn = db["deposits"].find_one({
