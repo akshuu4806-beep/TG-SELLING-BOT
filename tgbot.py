@@ -1116,13 +1116,15 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         state = get_state(user_id)
 
         photo_file_id = state.get("pending_photo_id")
+        qr_gen_time = state.get("qr_generated_at") # QR generate hone ka time
+
         if not photo_file_id:
             await callback.answer("❌ Session expired ya photo nahi mili! Kripya dobara deposit try karein.", show_alert=True)
             return
 
         msg_wait = await callback.message.edit_text("🔍 Bot screenshot verify kar raha hai, kripya intezaar karein...")
 
-        # Yahan ab AI verification run hogi jab user click karega
+        # Photo download karke AI se details extract karna
         photo_bytes_io = await client.download_media(photo_file_id, in_memory=True)
         photo_bytes = photo_bytes_io.getvalue()
 
@@ -1133,11 +1135,12 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         ss_date = details.get("date")
         ss_time = details.get("time")
         ss_amount = details.get("amount")
+        ss_receiver = details.get("receiver")
         is_valid = details.get("is_valid_ss")
 
         # 1. Validity Check
         if not is_valid or (not upi_txn_id and not google_txn_id) or not ss_date or not ss_time:
-            state["state"] = "awaiting_deposit_ss"  # State wapas on kar diya taaki dobara SS bhej sake
+            state["state"] = "awaiting_deposit_ss"
             await msg_wait.edit_text(
                 "❌ **Galt ya Adhoora Screenshot!**\n\n"
                 "Transaction ID, Date ya Time saaf nahi dikh raha hai.\n\n"
@@ -1147,14 +1150,33 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 
         # 2. Amount Match Check
         if ss_amount is not None and float(ss_amount) != float(amount):
-            state["state"] = "awaiting_deposit_ss"  # State wapas on kar diya
+            state["state"] = "awaiting_deposit_ss"
             await msg_wait.edit_text(
                 f"❌ **Amount Mismatch!** Aapne ₹{amount} ki request dali thi par SS me ₹{ss_amount} hai.\n\n"
                 "👉 **Kripya sahi amount ka real screenshot dobara send karein:**"
             )
             return
 
-        # 3. Duplicate Transaction Check
+        # 3. Time Validation Check (Scanner generate hone ke baad ka hona chahiye)
+        if qr_gen_time and ss_date and ss_time:
+            ss_dt = parse_ss_datetime(ss_date, ss_time)
+            if ss_dt and ss_dt < qr_gen_time:
+                state["state"] = "awaiting_deposit_ss"
+                await msg_wait.edit_text(
+                    "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai (Purana SS).\n\n"
+                    "👉 **Kripya naya payment karke uska fresh screenshot bhejien:**"
+                )
+                return
+
+        # 4. Receiver UPI ID Match Check (Optional/Strict check agar receiver extract ho)
+        if ss_receiver and UPI_ID:
+            clean_ss_recv = re.sub(r'[\s@]', '', str(ss_receiver)).lower()
+            clean_bot_upi = re.sub(r'[\s@]', '', str(UPI_ID)).lower()
+            if clean_bot_upi not in clean_ss_recv and clean_ss_recv not in clean_bot_upi:
+                # Agar receiver match nahi hota toh warning ya manual verify par bhej sakte hain
+                print(f"Warning: SS Receiver '{ss_receiver}' did not strictly match Bot UPI '{UPI_ID}'")
+
+        # 5. Duplicate Transaction Check
         existing_txn = db["deposits"].find_one({
             "$or": [
                 {"upi_txn_id": upi_txn_id} if upi_txn_id else {"upi_txn_id": "NONE"},
@@ -1162,14 +1184,14 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             ]
         })
         if existing_txn:
-            state["state"] = "awaiting_deposit_ss"  # State wapas on kar diya
+            state["state"] = "awaiting_deposit_ss"
             await msg_wait.edit_text(
                 "❌ **Duplicate Transaction ID!** Yeh UTR pehle hi use ho chuki hai.\n\n"
                 "👉 **Kripya naya screenshot dobara send karein:**"
             )
             return
 
-        # Sab theek hai toh database me save karke balance add kar do
+        # Sabhi checks pass hone ke baad database me save karke balance add kar do
         db["deposits"].insert_one({
             "user_id": user_id,
             "upi_txn_id": upi_txn_id,
@@ -1206,19 +1228,25 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         )
         await msg_wait.edit_text(success_text)
 
-        # Group me log bhejna
+        # Log groups par message bhejna
+        group_msg = (
+            f"🎉 **Payment Approved Successful (Auto)!**\n\n"
+            f"👤 **User:** {callback.from_user.mention}\n"
+            f"🆔 **User ID:** `{user_id}`\n"
+            f"💰 **Amount Added:** ₹{amount}\n"
+            f"🔢 **Txn ID / UTR:** `{upi_txn_id or google_txn_id}`\n"
+            f"🤖 **Approved By:** Automatic Bot"
+        )
         try:
-            group_msg = (
-                f"🎉 **Payment Approved Successful (Auto)!**\n\n"
-                f"👤 **User:** {callback.from_user.mention}\n"
-                f"🆔 **User ID:** `{user_id}`\n"
-                f"💰 **Amount Added:** ₹{amount}\n"
-                f"🔢 **Txn ID / UTR:** `{upi_txn_id or google_txn_id}`\n"
-                f"🤖 **Approved By:** Automatic Bot"
-            )
             await bot.send_message(PAYMENT_LOG_GROUP, group_msg)
         except Exception as e:
-            print(f"Group log err: {e}")
+            print(f"Payment group log err: {e}")
+
+        try:
+            await bot.send_message(OTP_GROUP_ID, group_msg)
+        except Exception as e:
+            print(f"OTP group log err: {e}")
+            
 
     elif data.startswith("do_manual_verify_"):
         parts = data.split("_")
