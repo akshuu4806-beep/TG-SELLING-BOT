@@ -1158,15 +1158,26 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             return
 
         # 3. Time Validation Check (Scanner generate hone ke baad ka hona chahiye)
+        # 3. Time Validation Check (Scanner generate hone ke baad ka hona chahiye)
         if qr_gen_time and ss_date and ss_time:
             ss_dt = parse_ss_datetime(ss_date, ss_time)
-            if ss_dt and ss_dt < qr_gen_time:
+            
+            # Agar AI ne time sahi se parse nahi kiya ya time QR generate hone se pehle ka hai
+            if not ss_dt or ss_dt < qr_gen_time:
                 state["state"] = "awaiting_deposit_ss"
                 await msg_wait.edit_text(
-                    "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai (Purana SS).\n\n"
+                    "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai ya time match nahi hua (Purana SS).\n\n"
                     "👉 **Kripya naya payment karke uska fresh screenshot bhejien:**"
                 )
                 return
+        else:
+            # Agar screenshot me date/time hi nahi mila, toh safety ke liye auto-approve mat karo
+            state["state"] = "awaiting_deposit_ss"
+            await msg_wait.edit_text(
+                "❌ **Time Verification Failed!** Screenshot se payment ka time read nahi ho paya.\n\n"
+                "👉 **Kripya saaf screenshot dobara send karein:**"
+            )
+            return
 
         # 4. Receiver UPI ID Match Check (Strict Check)
         if ss_receiver and UPI_ID:
