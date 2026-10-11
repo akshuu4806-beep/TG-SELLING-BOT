@@ -373,6 +373,7 @@ async def build_force_join_keyboard():
 
 # ================= START COMMAND =================
 @bot.on_message(filters.command("start"))
+@bot.on_message(filters.command("start"))
 async def start_cmd(client: Client, message: Message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name
@@ -381,9 +382,7 @@ async def start_cmd(client: Client, message: Message):
     if len(message.command) > 1:
         try:
             raw_ref = message.command[1]
-            # Extra text ko remove karke clean user_id extract karna
             clean_ref = raw_ref.replace("REF", "").replace("4F886", "").strip()
-            
             possible_ref = int(clean_ref)
             if possible_ref != user_id:
                 referrer_id = possible_ref
@@ -402,34 +401,83 @@ async def start_cmd(client: Client, message: Message):
         )
         return
 
-    # Referral link generate karna
     bot_info = await client.get_me()
     bot_name = bot_info.first_name.upper()
     ref_link = f"https://t.me/{bot_info.username}?start=REF{user_id}4F886"
 
-    stylish_welcome_text = (
-        f"╔══════════════════════════╗\n"
-        f"║   💎 **WELCOME TO** 💎   ║\n"
-        f"║   **{bot_name}**          \n"
-        f"╚══════════════════════════╝\n\n"
-        f"👋 **Welcome, {first_name}!**\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 **REFER & EARN PROGRAM** 💎\n"
-        f"├ 🎁 **Bonus Rate:** `2% Instant Cashback`\n"
-        f"├ 💸 **Kaise Kamayein:** Jab bhi aapka dost wallet me deposit karega, 2% bonus seedhe aapke wallet me add ho jayega!\n"
-        f"└ 📊 **Unlimited Earnings:** Jitna refer karoge, utna zyada profit!\n\n"
-        f"🔗 **Your Referral Link:**\n"
-        f"`{ref_link}`\n\n"
-        f"⚡ Choose an option below: ⚡\n"
-        f"───────────────"
-    )
+    # Database se check karna ki koi custom message set hai ya nahi
+    custom_config = settings_col.find_one({"type": "custom_start_message"})
+    
+    if custom_config and "message" in custom_config:
+        # Agar custom message set hai toh variables replace karke wahi bhejenge
+        stylish_welcome_text = custom_config["message"].format(
+            first_name=first_name,
+            bot_name=bot_name,
+            ref_link=ref_link
+        )
+    else:
+        # Default Welcome Message agar koi custom set nahi hai
+        stylish_welcome_text = (
+            f"╔══════════════════════════╗\n"
+            f"║   💎 **WELCOME TO** 💎   ║\n"
+            f"║   **{bot_name}**          \n"
+            f"╚══════════════════════════╝\n\n"
+            f"👋 **Welcome, {first_name}!**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 **REFER & EARN PROGRAM** 💎\n"
+            f"├ 🎁 **Bonus Rate:** `2% Instant Cashback`\n"
+            f"├ 💸 **Kaise Kamayein:** Jab bhi aapka dost wallet me deposit karega, 2% bonus seedhe aapke wallet me add ho jayega!\n"
+            f"└ 📊 **Unlimited Earnings:** Jitna refer karoge, utna zyada profit!\n\n"
+            f"🔗 **Your Referral Link:**\n"
+            f"`{ref_link}`\n\n"
+            f"⚡ Choose an option below: ⚡\n"
+            f"───────────────"
+        )
 
     await message.reply_text(
         text=stylish_welcome_text,
         reply_markup=main_keyboard(),
         disable_web_page_preview=True
     )
+    
+# Custom Start Message Set karne ke liye command
+@bot.on_message(filters.command("setstartmsg") & filters.private)
+async def set_start_msg_cmd(client: Client, message: Message):
+    if int(message.from_user.id) not in OWNER_IDS:
+        return
 
+    input_text = message.text.split(maxsplit=1)
+    if len(input_text) < 2:
+        await message.reply_text(
+            "⚠️ **Format:**\n"
+            "`/setstartmsg Aapka naya welcome message yahan likhein...`\n\n"
+            "Aap isme variables use kar sakte hain:\n"
+            "- `{first_name}`: User ka naam\n"
+            "- `{bot_name}`: Bot ka naam\n"
+            "- `{ref_link}`: Referral link"
+        )
+        return
+
+    new_msg = input_text[1].strip()
+    
+    # MongoDB me save karna
+    settings_col.update_one(
+        {"type": "custom_start_message"},
+        {"$set": {"message": new_msg}},
+        upsert=True
+    )
+    await message.reply_text("✅ **Custom Start Message Successfully Set Ho Gaya Hai!**")
+
+# Default Start Message par wapas laane ke liye command
+@bot.on_message(filters.command("resetstartmsg") & filters.private)
+async def reset_start_msg_cmd(client: Client, message: Message):
+    if int(message.from_user.id) not in OWNER_IDS:
+        return
+
+    # Database se custom message delete/reset karna
+    settings_col.delete_one({"type": "custom_start_message"})
+    await message.reply_text("🔄 **Start Message Reset Ho Kar Default Wala Ho Gaya Hai!**")
+    
 @bot.on_message(filters.command("add") & filters.private)
 async def add_single_acc_cmd(client: Client, message: Message):
     user_id = message.from_user.id
