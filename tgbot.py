@@ -632,14 +632,40 @@ async def list_fjoin_cmd(client: Client, message: Message):
     await message.reply_text(text)
 
 # 3. Reset/Clear All Force Join Limits
+# 3. Reset/Clear Specific Force Join Channel by Username/Link
 @bot.on_message(filters.command("clearfjoin") & filters.private)
 async def clear_fjoin_cmd(client: Client, message: Message):
     if int(message.from_user.id) not in OWNER_IDS:
         return
 
-    settings_col.update_one({"type": "force_join"}, {"$set": {"channels": []}}, upsert=True)
-    await message.reply_text("🧹 **Saare Force Join Channels/Groups clear kar diye gaye hain!**")
+    input_text = message.text.split(maxsplit=1)
+    if len(input_text) < 2:
+        await message.reply_text(
+            "⚠️ **Format:**\n`/clearfjoin @username_or_link`\n\n"
+            "**Example:**\n"
+            "`/clearfjoin @itz_darkX`"
+        )
+        return
 
+    target = input_text[1].strip()
+    config = settings_col.find_one({"type": "force_join"})
+    
+    if not config or "channels" not in config:
+        await message.reply_text("ℹ️ Koi bhi Force Join channel set nahi hai.")
+        return
+
+    channels = config.get("channels", [])
+    
+    # Target username ya link se match karke remove karna
+    new_channels = [c for c in channels if c["username"] != target and c["link"] != target]
+
+    if len(new_channels) == len(channels):
+        await message.reply_text(f"❌ '{target}' se milta hua koi bhi channel/group list me nahi mila!")
+        return
+
+    settings_col.update_one({"type": "force_join"}, {"$set": {"channels": new_channels}}, upsert=True)
+    await message.reply_text(f"✅ **Success!** `{target}` ko Force Join list se hata diya gaya hai.")
+    
 # ================= RESET DATABASE COMMAND (OWNER ONLY) =================
 @bot.on_message(filters.command("resetdb") & filters.private)
 async def reset_database_cmd(client: Client, message: Message):
