@@ -1013,6 +1013,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         await callback.message.edit_text("🛒 **Select Account Category:**", reply_markup=keyboard)
 
     elif data in ["buy_type_spam", "buy_type_fresh"]:
+        await cleanup_user_login(user_id)  # Yeh line yahan add kar dein
         selected_type = "spam" if "spam" in data else "fresh"
         countries = get_available_countries(selected_type)
         if not countries:
@@ -1037,6 +1038,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(f"🛒 **Select Country ({selected_type.upper()}):**", reply_markup=InlineKeyboardMarkup(btn_list))
 
     elif data.startswith("select_country_"):
+        await cleanup_user_login(user_id)  # Yeh line bhi yahan add kar dein
         parts = data.split("_")
         selected_type = parts[2]
         selected_country = "_".join(parts[3:])
