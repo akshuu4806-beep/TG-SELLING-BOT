@@ -1401,17 +1401,17 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             upsert=True
         )
 
-        await msg_wait.edit_text(
-            "⏳ **Manual Request Submitted!**\n\n"
-            "Aapka screenshot saari details ke sath admin ke paas bhej diya gaya hai. Kripya thoda intezaar karein."
-        )
+        # 🛠️ Yahan try-except lagane se error nahi aayega agar text same raha toh
+        try:
+            await msg_wait.edit_text(
+                "⏳ **Manual Request Submitted!**\n\n"
+                "Aapka screenshot saari details ke sath admin ke paas bhej diya gaya hai. Kripya thoda intezaar karein."
+            )
+        except Exception:
+            pass
 
         # Admin group me poori details (UTR, Date, Time) aur Approve/Reject buttons ke sath bhej na
-        # Admin group me poori details (UTR, Date, Time) aur Approve/Reject buttons ke sath bhej na
         username = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
-        
-        masked_sender_upi = mask_upi_id(customer_upi) # UPI ko mask karne ke liye
-        
         admin_caption = (
             f"💵 **New Manual Deposit Request**\n\n"
             f"👤 **User:** {callback.from_user.mention}\n"
@@ -1419,7 +1419,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Amount:** ₹{amount}\n"
             f"🔢 **UPI Txn ID:** `{upi_txn_id}`\n"
-            f"💳 **Customer UPI:** `{masked_sender_upi}`\n"  # <--- Yahan google_txn_id ki jagah customer_upi kar diya
+            f"💳 **Customer UPI:** `{customer_upi or 'N/A'}`\n" # <--- Yahan google_txn_id ki jagah customer_upi kar diya gaya hai
             f"📅 **Txn Date:** `{ss_date}`\n"
             f"⏰ **Txn Time:** `{ss_time}`"
         )
@@ -1438,6 +1438,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             )
         except Exception as e:
             print(f"Admin group send err: {e}")
+            
 
     elif data.startswith("buy_acc_"):
         target_phone = data.replace("buy_acc_", "")
