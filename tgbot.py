@@ -1326,8 +1326,10 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"👤 **User:** {callback.from_user.mention}\n"
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Amount Added:** ₹{amount}\n"
-            f"🔢 **Txn ID / UTR:** `{upi_txn_id or google_txn_id}`\n"
-            f"🤖 **Approved By:** Automatic Bot"
+            f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"      # <--- Alag line UPI ke liye
+            f"🌐 **Google Txn ID:** `{google_txn_id or 'N/A'}`\n"
+            f"🤖 **Approved By:** Automatic Bot\n\n"
+            f"🤖 **Bot :** @DarktgOtp_bot\n"
         )
         try:
             await bot.send_message(PAYMENT_LOG_GROUP, group_msg)
@@ -1718,8 +1720,10 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"📛 **Username:** {username_str}\n"
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Amount Added:** ₹{amount}\n"
-                f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Approved By:** {callback.from_user.mention}"
+                f"🔢 **UPI Txn ID:** `{txn_id}`\n"                   # <--- Ya agar aap yahan bhi `upi_txn_id` use karna chahein
+                f"🌐 **Google Txn ID:** `{google_txn_id or 'N/A'}`\n" #
+                f"👑 **Approved By:** {callback.from_user.mention}\n\n"
+                f"🤖 **Bot :** @DarktgOtp_bot\n"
             )
             
             # 1. Payment Verification Group par bhejna
