@@ -94,10 +94,10 @@ ai_client = genai.Client(api_key=API_KEYS[current_key_index])
 _session_locks: dict = {}       # {session_name: asyncio.Lock}
 _busy_phones: set = set()       # Currently in-use phones
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 def get_formatted_time():
-    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     date_str = now.strftime("%d-%m-%Y")
     time_str = now.strftime("%I:%M:%S %p")
     return date_str, time_str
@@ -1339,8 +1339,9 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         masked_sender_upi = mask_upi_id(customer_upi)
         # Log groups par message bhejna
         # Log groups par message bhejna
-        from datetime import timedelta
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30) # <--- Yahan change karein
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         auto_date_str = now.strftime("%d-%m-%Y")
         auto_time_str = now.strftime("%I:%M:%S %p")
         approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
@@ -1746,8 +1747,9 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 
             masked_sender_upi = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
 
-            from datetime import timedelta
-            now = datetime.utcnow() + timedelta(hours=5, minutes=30) # <--- Yahan bhi change karein
+            from datetime import timezone
+
+            now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             approval_date_str = now.strftime("%d-%m-%Y")
             approval_time_str = now.strftime("%I:%M:%S %p")
             approved_by_info = f"{callback.from_user.mention} at {approval_date_str} {approval_time_str}"
