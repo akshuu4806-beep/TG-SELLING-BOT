@@ -126,8 +126,8 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
         "5. 'amount': Numeric payment amount shown on SS (null if missing).\n"
         "6. 'receiver': Receiver UPI ID or Name shown on SS (null if missing).\n"
         "7. 'is_valid_ss': true if it's a valid successful payment receipt with transaction IDs, date and time, else false.\n\n"
-        "Respond ONLY with valid JSON with keys: upi_txn_id, google_txn_id, date, time, amount, receiver, is_valid_ss."
-    )  
+        "Respond ONLY with valid JSON with keys: upi_txn_id, customer_upi, date, time, amount, receiver, is_valid_ss."
+    )
     
     # Stable aur supported models list
     models_to_try = ['gemini-3.8-flash', 'gemini-1.5-flash']
@@ -1372,7 +1372,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             await callback.answer("❌ Session expired! Kripya dobara try karein.", show_alert=True)
             return
 
-        msg_wait = await callback.message.edit_text("⏳ Processing manual verification request...")
+        msg_wait = await callback.message.edit_text("⏳ Processing manual verification request... It takes 1 to 2 mints")
 
         # Photo download karke AI se details extract karna taaki UTR, Date, Time mil sake
         photo_bytes_io = await client.download_media(photo_file_id, in_memory=True)
@@ -1407,7 +1407,11 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         )
 
         # Admin group me poori details (UTR, Date, Time) aur Approve/Reject buttons ke sath bhej na
+        # Admin group me poori details (UTR, Date, Time) aur Approve/Reject buttons ke sath bhej na
         username = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
+        
+        masked_sender_upi = mask_upi_id(customer_upi) # UPI ko mask karne ke liye
+        
         admin_caption = (
             f"💵 **New Manual Deposit Request**\n\n"
             f"👤 **User:** {callback.from_user.mention}\n"
@@ -1415,7 +1419,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Amount:** ₹{amount}\n"
             f"🔢 **UPI Txn ID:** `{upi_txn_id}`\n"
-            f"🌐 **Google Txn ID:** `{google_txn_id}`\n"
+            f"💳 **Customer UPI:** `{masked_sender_upi}`\n"  # <--- Yahan google_txn_id ki jagah customer_upi kar diya
             f"📅 **Txn Date:** `{ss_date}`\n"
             f"⏰ **Txn Time:** `{ss_time}`"
         )
