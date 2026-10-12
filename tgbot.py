@@ -1219,7 +1219,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         details = await extract_ss_details(photo_bytes)
 
         upi_txn_id = details.get("upi_txn_id")
-        google_txn_id = details.get("google_txn_id")
+        customer_upi = details.get("customer_upi") or "N/A"
         ss_date = details.get("date")
         ss_time = details.get("time")
         ss_amount = details.get("amount")
@@ -1380,7 +1380,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 
         details = await extract_ss_details(photo_bytes)
         upi_txn_id = details.get("upi_txn_id") or "N/A"
-        google_txn_id = details.get("google_txn_id") or "N/A"
+        customer_upi = details.get("customer_upi")
         ss_date = details.get("date") or "N/A"
         ss_time = details.get("time") or "N/A"
 
