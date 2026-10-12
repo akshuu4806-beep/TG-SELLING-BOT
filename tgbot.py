@@ -100,13 +100,27 @@ def get_formatted_time():
     time_str = now.strftime("%I:%M:%S %p")
     return date_str, time_str
 
+def mask_upi_id(upi: str) -> str:
+    if not upi or "@" not in upi:
+        return "N/A"
+    parts = upi.split("@")
+    name = parts[0]
+    domain = parts[1]
+    
+    if len(name) <= 3:
+        masked_name = name[0] + "*" * (len(name) - 1)
+    else:
+        masked_name = name[:2] + "*" * (len(name) - 4) + name[-2:]
+        
+    return f"{masked_name}@{domain}"
+
 async def extract_ss_details(photo_bytes: bytes) -> dict:
     global current_key_index, ai_client
     
     prompt = (
         "Analyze this payment screenshot. Extract details in JSON format:\n"
         "1. 'upi_txn_id': UPI transaction ID / UTR / Reference No (null if missing).\n"
-        "2. 'google_txn_id': Google transaction ID if present (null if missing).\n"
+        "2. 'customer_upi': Sender or Customer UPI ID shown on SS (null if missing).\n"
         "3. 'date': Payment date as shown on SS in 'YYYY-MM-DD' format. Return null if missing.\n"
         "4. 'time': Payment time as shown on SS in 'HH:MM:SS AM/PM' or 'HH:MM' format. Return null if missing.\n"
         "5. 'amount': Numeric payment amount shown on SS (null if missing).\n"
@@ -148,7 +162,7 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
                     continue
                 break
 
-    return {"is_valid_ss": False, "upi_txn_id": None, "google_txn_id": None, "date": None, "time": None, "amount": None, "receiver": None}
+    return {"is_valid_ss": False, "upi_txn_id": None, "customer_upi": None, "date": None, "time": None, "amount": None, "receiver": None}
 
 def parse_ss_datetime(date_str: str, time_str: str):
     """
@@ -1287,7 +1301,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         db["deposits"].insert_one({
             "user_id": user_id,
             "upi_txn_id": upi_txn_id,
-            "google_txn_id": google_txn_id,
+            "customer_upi": customer_upi,
             "amount": amount,
             "date": ss_date,
             "time": ss_time,
@@ -1319,16 +1333,22 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"✨ Aapka payment successfully verify karke wallet me add kar diya gaya hai!"
         )
         await msg_wait.edit_text(success_text)
-
+        
+        masked_sender_upi = mask_upi_id(customer_upi)
         # Log groups par message bhejna
+        now = datetime.now()
+        auto_date_str = now.strftime("%d-%m-%Y")
+        auto_time_str = now.strftime("%I:%M:%S %p")
+        approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
+        
         group_msg = (
             f"🎉 **Payment Approved Successful (Auto)!**\n\n"
             f"👤 **User:** {callback.from_user.mention}\n"
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Amount Added:** ₹{amount}\n"
             f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"      # <--- Alag line UPI ke liye
-            f"🌐 **Google Txn ID:** `{google_txn_id or 'N/A'}`\n"
-            f"🤖 **Approved By:** Automatic Bot\n\n"
+            f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
+            f"🤖 **Approved By:** {approved_info}\n\n"
             f"🤖 **Bot :** @DarktgOtp_bot\n"
         )
         try:
@@ -1371,7 +1391,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 "$set": {
                     "user_id": user_id,
                     "upi_txn_id": upi_txn_id if upi_txn_id != "N/A" else None,
-                    "google_txn_id": google_txn_id if google_txn_id != "N/A" else None,
+                    "customer_upi": customer_upi if customer_upi else None,
                     "amount": amount,
                     "date": ss_date,
                     "time": ss_time,
@@ -1714,6 +1734,13 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             except Exception:
                 pass
 
+            masked_sender_upi = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
+
+            now = datetime.now()
+            approval_date_str = now.strftime("%d-%m-%Y")
+            approval_time_str = now.strftime("%I:%M:%S %p")
+            approved_by_info = f"{callback.from_user.mention} at {approval_date_str} {approval_time_str}"
+            # -----------------------------
             group_approve_msg = (
                 f"🎉 **Payment Approved Successful!**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -1721,8 +1748,8 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Amount Added:** ₹{amount}\n"
                 f"🔢 **UPI Txn ID:** `{txn_id}`\n"                   # <--- Ya agar aap yahan bhi `upi_txn_id` use karna chahein
-                f"🌐 **Google Txn ID:** `{google_txn_id or 'N/A'}`\n" #
-                f"👑 **Approved By:** {callback.from_user.mention}\n\n"
+                f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
+                f"👑 **Approved By:** {approved_by_info}\n\n"
                 f"🤖 **Bot :** @DarktgOtp_bot\n"
             )
             
@@ -1745,6 +1772,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 {"$set": {"status": "rejected"}}
             )
 
+            masked_sender_upi = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
             log_group_msg = (
                 f"❌ **Deposit Rejected**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -1752,6 +1780,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Rejected Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
+                f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
                 f"👑 **Rejected By:** {callback.from_user.mention}"
             )
             await callback.message.edit_text(log_group_msg)
