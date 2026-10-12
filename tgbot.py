@@ -1595,7 +1595,8 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             user_mention = callback.from_user.mention
             username_str = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
 
-            total_bought_count = accounts_col.count_documents({"buyer_id": user_id, "sold": True})
+            # Account ka price fetch karna
+            acc_price = acc.get("price", 0.0)
 
             # User ka referral link generate karna
             bot_info = await client.get_me()
@@ -1607,7 +1608,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"📛 **Username:** {username_str}\n"
                 f"🆔 **User ID:** `{user_id}`\n"
                 f"📱 **Account Number:** `{masked_num}`\n"
-                f"📊 **Total Accounts Bought:** `{total_bought_count}`\n\n"
+                f"💰 **Price:** ₹{acc_price}\n\n"
                 f"✨ **Thanks for purchase!**\n"
                 f"🔗 **Referral Link:** `{ref_link}`"
             )
