@@ -1229,7 +1229,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         is_valid = details.get("is_valid_ss")
 
         # 1. Validity Check
-        if not is_valid or (not upi_txn_id and not google_txn_id) or not ss_date or not ss_time:
+        if not is_valid or not upi_txn_id or not ss_date or not ss_time:
             state["state"] = "awaiting_deposit_ss"
             await msg_wait.edit_text(
                 "❌ **Galt ya Adhoora Screenshot!**\n\n"
@@ -1286,10 +1286,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 
         # 5. Duplicate Transaction Check
         existing_txn = db["deposits"].find_one({
-            "$or": [
-                {"upi_txn_id": upi_txn_id} if upi_txn_id else {"upi_txn_id": "NONE"},
-                {"google_txn_id": google_txn_id} if google_txn_id else {"google_txn_id": "NONE"}
-            ]
+            "upi_txn_id": upi_txn_id if upi_txn_id else "NONE"
         })
         if existing_txn:
             state["state"] = "awaiting_deposit_ss"
@@ -1331,7 +1328,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         success_text = (
             f"🎉 **Deposit Auto-Approved Successfully!**\n\n"
             f"💰 **Amount Added:** ₹{amount}\n"
-            f"🔢 **Txn ID:** `{upi_txn_id or google_txn_id}`\n"
+            f"🔢 **Txn ID:** `{upi_txn_id or 'N/A'}`\n"
             f"✨ Aapka payment successfully verify karke wallet me add kar diya gaya hai!"
         )
         await msg_wait.edit_text(success_text)
