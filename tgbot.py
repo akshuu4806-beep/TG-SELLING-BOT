@@ -555,8 +555,13 @@ async def add_single_acc_cmd(client: Client, message: Message):
         return
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 Spam Account", callback_data="add_type_spam")],
-        [InlineKeyboardButton("🌱 Fresh Account", callback_data="add_type_fresh")]
+        [
+            InlineKeyboardButton("🔥 Spam Account", callback_data="add_type_spam"),
+            InlineKeyboardButton("🌱 Fresh Account", callback_data="add_type_fresh")
+        ],
+        [
+            InlineKeyboardButton("🆕 New Registered", callback_data="add_type_registered")
+        ]
     ])
     await message.reply_text("🌍 **[Owner]** Select Account Type:", reply_markup=keyboard)
 
@@ -636,7 +641,7 @@ async def add_bulk_cmd(client: Client, message: Message):
                 continue
             phone = parts[3]
             password = parts[4] if len(parts) > 4 and parts[4].lower() != "none" else None
-            acc_type = parts[5].lower() if len(parts) > 5 and parts[5].lower() in ["spam", "fresh"] else "fresh"
+            acc_type = parts[5].lower() if len(parts) > 5 and parts[5].lower() in ["spam", "fresh", "registered"] else "fresh"
             
             queue.append({
                 "c_name": c_name, "c_code": c_code, 
@@ -891,6 +896,7 @@ async def process_next_bulk_account(client, user_id, message_or_cb):
 
 # ================= STOCK CHECK COMMAND =================
 @bot.on_message(filters.command("stock") & filters.private)
+@bot.on_message(filters.command("stock") & filters.private)
 async def stock_cmd(client: Client, message: Message):
     user_id = message.from_user.id
     if int(user_id) not in OWNER_IDS:
@@ -925,13 +931,12 @@ async def stock_cmd(client: Client, message: Message):
     for item in stock_data:
         c_name = item["_id"]["country"]
         c_code = item["_id"]["code"]
-        # Database me type lower/upper kisi me bhi ho, standard UPPERCASE me read karo
         acc_type = str(item["_id"]["type"]).upper()
         count = item["count"]
 
         key = f"{c_name} ({c_code})"
         if key not in formatted_stock:
-            formatted_stock[key] = {"FRESH": 0, "SPAM": 0}
+            formatted_stock[key] = {"FRESH": 0, "SPAM": 0, "REGISTERED": 0}
         
         formatted_stock[key][acc_type] = count
 
@@ -944,12 +949,15 @@ async def stock_cmd(client: Client, message: Message):
     for country_info, types in formatted_stock.items():
         fresh_cnt = types.get("FRESH", 0)
         spam_cnt = types.get("SPAM", 0)
+        reg_cnt = types.get("REGISTERED", 0)
+        
         text += f"🌍 **{country_info}**\n"
         text += f"   ├── 🌱 Fresh: `{fresh_cnt}`\n"
-        text += f"   └── 🔥 Spam: `{spam_cnt}`\n\n"
+        text += f"   ├── 🔥 Spam: `{spam_cnt}`\n"
+        text += f"   └── 🆕 Registered: `{reg_cnt}`\n\n"
 
     await message.reply_text(text)
-
+    
 # ================= BROADCAST HANDLER =================
 @bot.on_message(filters.command(["broadcast", "gcast"]) & filters.user(OWNER_IDS))
 async def broadcast_cmd(client: Client, message: Message):
@@ -1145,14 +1153,23 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             [
                 InlineKeyboardButton("🔥 Spam Account", callback_data="add_type_spam"),
                 InlineKeyboardButton("🌱 Fresh Account", callback_data="add_type_fresh")
+            ],
+            [
+                InlineKeyboardButton("🆕 Registered Account", callback_data="add_type_registered")
             ]
         ])
         await callback.message.reply_text("🌍 **[Owner]** Select Account Type:", reply_markup=keyboard)
 
-    elif data in ["add_type_spam", "add_type_fresh"]:
+    elif data in ["add_type_spam", "add_type_fresh", "add_type_registered"]:
         if not is_owner:
             return
-        acc_type = "spam" if "spam" in data else "fresh"
+        if "spam" in data:
+            acc_type = "spam"
+        elif "registered" in data:
+            acc_type = "registered"
+        else:
+            acc_type = "fresh"
+
         state["temp_acc_type"] = acc_type
         state["state"] = "awaiting_country_name"
         await callback.message.edit_text(f"🌍 **[Owner - {acc_type.upper()}]** Enter Country Name (e.g. India, USA):")
@@ -1164,13 +1181,22 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 InlineKeyboardButton("🔥 Spam Accounts", callback_data="buy_type_spam"),
                 InlineKeyboardButton("🌱 Fresh Accounts", callback_data="buy_type_fresh")
             ],
+            [
+                InlineKeyboardButton("🆕 New Registered", callback_data="buy_type_registered")
+            ],
             [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
         ])
         await callback.message.edit_text("🛒 **Select Account Category:**", reply_markup=keyboard)
 
-    elif data in ["buy_type_spam", "buy_type_fresh"]:
-        await cleanup_user_login(user_id)  # Yeh line yahan add kar dein
-        selected_type = "spam" if "spam" in data else "fresh"
+    elif data in ["buy_type_spam", "buy_type_fresh", "buy_type_registered"]:
+        await cleanup_user_login(user_id)
+        if "spam" in data:
+            selected_type = "spam"
+        elif "registered" in data:
+            selected_type = "registered"
+        else:
+            selected_type = "fresh"
+
         countries = get_available_countries(selected_type)
         if not countries:
             await callback.answer(f"❌ No {selected_type.upper()} accounts in stock right now!", show_alert=True)
@@ -1179,8 +1205,6 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         btn_list = []
         for c in countries:
             c_name, c_count, c_code = c["_id"], c["count"], c["code"]
-            
-            # Flag emoji dynamic fetch logic
             flag = get_flag_emoji(c_name)
             
             btn_list.append([
@@ -1192,7 +1216,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         
         btn_list.append([InlineKeyboardButton("🔙 Back to Category", callback_data="buy_acc")])
         await callback.message.edit_text(f"🛒 **Select Country ({selected_type.upper()}):**", reply_markup=InlineKeyboardMarkup(btn_list))
-
+        
     elif data.startswith("select_country_"):
         await cleanup_user_login(user_id)  # Yeh line bhi yahan add kar dein
         parts = data.split("_")
