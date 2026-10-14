@@ -443,7 +443,6 @@ async def build_force_join_keyboard():
 
 # ================= START COMMAND =================
 @bot.on_message(filters.command("start"))
-@bot.on_message(filters.command("start"))
 async def start_cmd(client: Client, message: Message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name
@@ -896,7 +895,6 @@ async def process_next_bulk_account(client, user_id, message_or_cb):
 
 # ================= STOCK CHECK COMMAND =================
 @bot.on_message(filters.command("stock") & filters.private)
-@bot.on_message(filters.command("stock") & filters.private)
 async def stock_cmd(client: Client, message: Message):
     user_id = message.from_user.id
     if int(user_id) not in OWNER_IDS:
@@ -1183,8 +1181,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             ],
             [
                 InlineKeyboardButton("🆕 New Registered", callback_data="buy_type_registered")
-            ],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+            ]
         ])
         await callback.message.edit_text("🛒 **Select Account Category:**", reply_markup=keyboard)
 
