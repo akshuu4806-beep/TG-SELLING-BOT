@@ -1941,7 +1941,9 @@ async def handle_text(client: Client, message: Message):
                 InlineKeyboardButton("🔥 Spam Accounts", callback_data="buy_type_spam"),
                 InlineKeyboardButton("🌱 Fresh Accounts", callback_data="buy_type_fresh")
             ],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+            [
+                InlineKeyboardButton("🆕 New Registered", callback_data="buy_type_registered")
+            ]
         ])
         await message.reply_text("🛒 **Select Account Category:**", reply_markup=keyboard)
         return
