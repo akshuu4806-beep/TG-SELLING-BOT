@@ -367,31 +367,68 @@ async def get_force_join_channels():
 async def is_user_joined(client: Client, user_id: int) -> bool:
     channels = await get_force_join_channels()
     for ch in channels:
-        target = ch["username"]
-        try:
-            chat_identifier = target
-            if chat_identifier.startswith("https://t.me/"):
-                chat_identifier = "@" + chat_identifier.split("/")[-1]
-
-            # 1. Pehle normal member check karenge
-            member = await client.get_chat_member(chat_identifier, user_id)
-            if member.status in ["left", "kicked", "banned"]:
-                return False
-        except UserNotParticipant:
-            # 2. Agar user direct member nahi hai, toh check karo kya usne Join Request bheji hai?
+        target = str(ch.get("username", "")).strip()
+        link = str(ch.get("link", "")).strip()
+        
+        # Identifier extract logic
+        chat_identifier = None
+        
+        # 1. Check if target is integer ID like -1003944403417
+        if target.startswith("-100") or (target.startswith("-") and target[1:].isdigit()) or target.isdigit():
             try:
-                # Bot ke paas chat me invite/admin rights hone chahiye yeh check karne ke liye
-                async for req in client.get_chat_join_requests(chat_identifier, user_id=user_id):
-                    if req.user.id == user_id:
-                        return True # Agar request list me user mil gaya toh verified!
-            except Exception as req_err:
-                print(f"Join Request check error for {target}: {req_err}")
-            
-            return False
+                chat_identifier = int(target)
+            except ValueError:
+                chat_identifier = target
+        # 2. Check if username starts with @
+        elif target.startswith("@"):
+            chat_identifier = target
+        # 3. Handle t.me links
+        elif "t.me/" in target:
+            clean_part = target.split("t.me/")[-1].replace("/", "")
+            if clean_part.startswith("+") or "joinchat" in clean_part:
+                chat_identifier = link if ("t.me/" in link and not link.startswith("+")) else target
+            else:
+                chat_identifier = "@" + clean_part
+        else:
+            chat_identifier = "@" + target if not target.startswith("+") else target
+
+        # Step A: Member check
+        is_verified = False
+        try:
+            member = await client.get_chat_member(chat_identifier, user_id)
+            if member.status not in ["left", "kicked", "banned"]:
+                is_verified = True
+        except UserNotParticipant:
+            is_verified = False
         except Exception as e:
-            print(f"Force Join Check Error for {target}: {e}")
+            print(f"Direct member check failed for {chat_identifier}: {e}")
+
+        # Step B: If not direct member, check Join Requests
+        if not is_verified:
+            try:
+                async for req in client.get_chat_join_requests(chat_identifier):
+                    if req.user.id == user_id:
+                        is_verified = True
+                        break
+            except Exception as req_err:
+                print(f"Join Request check error for {chat_identifier}: {req_err}")
+
+        # Step C: Fallback check with link/username
+        if not is_verified and link and link != target:
+            try:
+                fallback_target = link.split("t.me/")[-1].replace("/", "")
+                if not fallback_target.startswith("+"):
+                    member = await client.get_chat_member("@" + fallback_target, user_id)
+                    if member.status not in ["left", "kicked", "banned"]:
+                        is_verified = True
+            except Exception:
+                pass
+
+        if not is_verified:
             return False
+
     return True
+    
     
 async def build_force_join_keyboard():
     channels = await get_force_join_channels()
@@ -522,6 +559,18 @@ async def add_single_acc_cmd(client: Client, message: Message):
         [InlineKeyboardButton("🌱 Fresh Account", callback_data="add_type_fresh")]
     ])
     await message.reply_text("🌍 **[Owner]** Select Account Type:", reply_markup=keyboard)
+
+@bot.on_chat_join_request()
+async def on_join_request(client: Client, chat_join_request):
+    user_id = chat_join_request.from_user.id
+    chat_id = chat_join_request.chat.id
+    
+    # Store join request state in DB for fast lookup
+    db["join_requests"].update_one(
+        {"user_id": user_id, "chat_id": chat_id},
+        {"$set": {"user_id": user_id, "chat_id": chat_id, "timestamp": datetime.now()}},
+        upsert=True
+    )
 
 # ================= TRACK CHATS & GROUPS =================
 @bot.on_chat_member_updated()
