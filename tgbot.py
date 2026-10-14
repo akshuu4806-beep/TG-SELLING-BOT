@@ -1129,7 +1129,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 
     elif data == "support":
         support_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Contact Support", url="https://t.me/Innocent_vaibhav")],
+            [InlineKeyboardButton("💬 Contact Support", url="https://t.me/ll_its_rudransh_ll")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
         ])
         await callback.message.edit_text(
@@ -1985,7 +1985,7 @@ async def handle_text(client: Client, message: Message):
 
     elif text == "🛠️ Support":
         support_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Contact Support", url="https://t.me/Innocent_vaibhav")]
+            [InlineKeyboardButton("💬 Contact Support", url="https://t.me/ll_its_rudransh_ll")]
         ])
         await message.reply_text(
             "🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:",
