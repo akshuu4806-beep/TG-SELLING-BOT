@@ -367,15 +367,32 @@ async def get_force_join_channels():
 async def is_user_joined(client: Client, user_id: int) -> bool:
     channels = await get_force_join_channels()
     for ch in channels:
+        target = ch["username"]
         try:
-            await client.get_chat_member(ch["username"], user_id)
+            chat_identifier = target
+            if chat_identifier.startswith("https://t.me/"):
+                chat_identifier = "@" + chat_identifier.split("/")[-1]
+
+            # 1. Pehle normal member check karenge
+            member = await client.get_chat_member(chat_identifier, user_id)
+            if member.status in ["left", "kicked", "banned"]:
+                return False
         except UserNotParticipant:
+            # 2. Agar user direct member nahi hai, toh check karo kya usne Join Request bheji hai?
+            try:
+                # Bot ke paas chat me invite/admin rights hone chahiye yeh check karne ke liye
+                async for req in client.get_chat_join_requests(chat_identifier, user_id=user_id):
+                    if req.user.id == user_id:
+                        return True # Agar request list me user mil gaya toh verified!
+            except Exception as req_err:
+                print(f"Join Request check error for {target}: {req_err}")
+            
             return False
         except Exception as e:
-            print(f"Force Join Check Error for {ch['username']}: {e}")
+            print(f"Force Join Check Error for {target}: {e}")
             return False
     return True
-
+    
 async def build_force_join_keyboard():
     channels = await get_force_join_channels()
     buttons = []
