@@ -2103,7 +2103,7 @@ async def handle_text(client: Client, message: Message):
             await cleanup_session(session_name, old_client)
         else:
             await cleanup_session(session_name)
-        acc_client = Client(session_name, api_id=API_ID, api_hash=API_HASH, phone_number=phone)
+        acc_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
 
         try:
             await acc_client.connect()
