@@ -576,6 +576,162 @@ async def on_join_request(client: Client, chat_join_request):
         upsert=True
     )
 
+# ================= CREDIT & DEBIT COMMANDS (OWNER ONLY) =================
+@bot.on_message(filters.command("credit") & filters.private)
+async def credit_cmd(client: Client, message: Message):
+    if int(message.from_user.id) not in OWNER_IDS:
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.reply_text(
+            "⚠️ **Format:**\n"
+            "`/credit <user_id_or_username> <amount>`\n\n"
+            "**Example:**\n"
+            "`/credit 123456789 500`\n"
+            "`/credit @username 200`"
+        )
+        return
+
+    target_identifier = args[1].strip()
+    try:
+        amount = float(args[2].strip())
+        if amount <= 0:
+            await message.reply_text("❌ Amount 0 se zyada honi chahiye!")
+            return
+    except ValueError:
+        await message.reply_text("❌ Invalid amount! Kripya sahi number dalein.")
+        return
+
+    # Target user ko find karna (UserID ya Username se)
+    query = {}
+    if target_identifier.startswith("@"):
+        # Username se find karne ke liye agar chat history me available ho
+        user_doc = users_col.find_one({"username": target_identifier.replace("@", "").lower()})
+        # Alternately pyrogram se user info nikal sakte hain
+        try:
+            resolved_user = await client.get_users(target_identifier)
+            query = {"user_id": resolved_user.id}
+            target_user_id = resolved_user.id
+            target_name = resolved_user.first_name
+        except Exception:
+            await message.reply_text("❌ Yeh username Telegram par nahi mila ya user ne bot start nahi kiya hai.")
+            return
+    else:
+        try:
+            target_user_id = int(target_identifier)
+            query = {"user_id": target_user_id}
+            resolved_user = await client.get_users(target_user_id)
+            target_name = resolved_user.first_name
+        except ValueError:
+            await message.reply_text("❌ Invalid User ID!")
+            return
+        except Exception:
+            target_name = "User"
+
+    # Wallet Update
+    target_user_data = get_user(target_user_id)
+    users_col.update_one(query, {"$inc": {"wallet": amount}})
+    
+    updated_user = users_col.find_one(query)
+    new_balance = updated_user.get("wallet", 0.0)
+
+    await message.reply_text(
+        f"✅ **Successfully Credited!**\n\n"
+        f"👤 **User:** {target_name} (`{target_user_id}`)\n"
+        f"💰 **Added Amount:** ₹{amount}\n"
+        f"💳 **New Wallet Balance:** ₹{new_balance:.2f}"
+    )
+
+    # User ko notification bhejna
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"🎁 **Your Wallet Has Been Credited!**\n\n"
+            f"💰 **Amount Added:** ₹{amount}\n"
+            f"💳 **Current Wallet Balance:** ₹{new_balance:.2f}\n"
+            f"👑 **Credited By:** Owner"
+        )
+    except Exception:
+        pass
+
+
+@bot.on_message(filters.command("debit") & filters.private)
+async def debit_cmd(client: Client, message: Message):
+    if int(message.from_user.id) not in OWNER_IDS:
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.reply_text(
+            "⚠️ **Format:**\n"
+            "`/debit <user_id_or_username> <amount>`\n\n"
+            "**Example:**\n"
+            "`/debit 123456789 200`\n"
+            "`/debit @username 100`"
+        )
+        return
+
+    target_identifier = args[1].strip()
+    try:
+        amount = float(args[2].strip())
+        if amount <= 0:
+            await message.reply_text("❌ Amount 0 se zyada honi chahiye!")
+            return
+    except ValueError:
+        await message.reply_text("❌ Invalid amount! Kripya sahi number dalein.")
+        return
+
+    # Target user ko find karna (UserID ya Username se)
+    query = {}
+    if target_identifier.startswith("@"):
+        try:
+            resolved_user = await client.get_users(target_identifier)
+            query = {"user_id": resolved_user.id}
+            target_user_id = resolved_user.id
+            target_name = resolved_user.first_name
+        except Exception:
+            await message.reply_text("❌ Yeh username Telegram par nahi mila ya user ne bot start nahi kiya hai.")
+            return
+    else:
+        try:
+            target_user_id = int(target_identifier)
+            query = {"user_id": target_user_id}
+            resolved_user = await client.get_users(target_user_id)
+            target_name = resolved_user.first_name
+        except ValueError:
+            await message.reply_text("❌ Invalid User ID!")
+            return
+        except Exception:
+            target_name = "User"
+
+    target_user_data = get_user(target_user_id)
+    current_balance = target_user_data.get("wallet", 0.0)
+
+    # Balance kam karne se pehle check karna ki sufficient balance hai ya nahi (optional, chahein toh negative me bhi jaane de sakte hain)
+    new_balance = current_balance - amount
+
+    users_col.update_one(query, {"$set": {"wallet": new_balance}})
+
+    await message.reply_text(
+        f"✅ **Successfully Debited!**\n\n"
+        f"👤 **User:** {target_name} (`{target_user_id}`)\n"
+        f"💸 **Deducted Amount:** ₹{amount}\n"
+        f"💳 **New Wallet Balance:** ₹{new_balance:.2f}"
+    )
+
+    # User ko notification bhejna
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"⚠️ **Your Wallet Has Been Debited!**\n\n"
+            f"💸 **Deducted Amount:** ₹{amount}\n"
+            f"💳 **Current Wallet Balance:** ₹{new_balance:.2f}\n"
+            f"👑 **Debited By:** Owner"
+        )
+    except Exception:
+        pass
+
 # ================= TRACK CHATS & GROUPS =================
 @bot.on_chat_member_updated()
 async def on_chat_member_update(client: Client, chat_member):
