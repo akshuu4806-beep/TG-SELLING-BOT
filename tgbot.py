@@ -1165,9 +1165,27 @@ async def broadcast_cmd(client: Client, message: Message):
 @bot.on_callback_query()
 async def callback_handler(client: Client, callback: CallbackQuery):
     user_id = callback.from_user.id
-    user = get_user(user_id)
-    state = get_state(user_id)
     data = callback.data
+    
+    # Agar user 'check_force_join' par click kar raha hai toh ise skip karna zaroori hai
+    if data != "check_force_join":
+        if not await is_user_joined(client, user_id):
+            keyboard = await build_force_join_keyboard()
+            try:
+                await callback.message.edit_text(
+                    "⚠️ **Aapne hamare required Channels/Groups ko leave kar diya hai!**\n\n"
+                    "Bot use karne ke liye pehle unhe join karein:",
+                    reply_markup=keyboard
+                )
+            except Exception:
+                await callback.message.reply_text(
+                    "⚠️ **Aapne channels/groups leave kar diye hain!** Pehle join karein:",
+                    reply_markup=keyboard
+                )
+            await callback.answer("❌ Pehle channels/groups join karein!", show_alert=True)
+            return
+    
+    state = get_state(user_id)
 
     is_owner = (int(user_id) in OWNER_IDS)
 
@@ -2081,6 +2099,17 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 @bot.on_message(filters.text & ~filters.command(["start", "add", "addbulk", "broadcast", "gcast"]))
 async def handle_text(client: Client, message: Message):
     user_id = message.from_user.id
+
+    # 🔴 FORCE JOIN LIVE CHECK (Leave karne par bhi pakad lega)
+    if not await is_user_joined(client, user_id):
+        keyboard = await build_force_join_keyboard()
+        await message.reply_text(
+            "⚠️ **Aapne hamare required Channels/Groups ko leave kar diya hai!**\n\n"
+            "Bot ko dobara use karne ke liye pehle sabhi channels/groups ko join karein:",
+            reply_markup=keyboard
+        )
+        return
+    
     text = message.text
     state = get_state(user_id)
     user = get_user(user_id)
