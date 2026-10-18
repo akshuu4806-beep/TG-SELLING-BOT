@@ -365,6 +365,11 @@ async def get_force_join_channels():
     ]
 
 async def is_user_joined(client: Client, user_id: int) -> bool:
+    # 🔴 Check if Force Join is globally disabled by owner
+    status_config = settings_col.find_one({"type": "force_join_status"})
+    if status_config and status_config.get("status") == "off":
+        return True
+        
     channels = await get_force_join_channels()
     for ch in channels:
         target = str(ch.get("username", "")).strip()
@@ -955,7 +960,31 @@ async def clear_fjoin_cmd(client: Client, message: Message):
 
     settings_col.update_one({"type": "force_join"}, {"$set": {"channels": new_channels}}, upsert=True)
     await message.reply_text(f"✅ **Success!** `{target}` ko Force Join list se hata diya gaya hai.")
-    
+
+# 1. Force Join OFF karne ke liye command
+@bot.on_message(filters.command("disablefjoin") & filters.private)
+async def disable_fjoin_cmd(client: Client, message: Message):
+    if int(message.from_user.id) not in OWNER_IDS:
+        return
+    settings_col.update_one(
+        {"type": "force_join_status"},
+        {"$set": {"status": "off"}},
+        upsert=True
+    )
+    await message.reply_text("🔴 **Force Join System Successfully OFF Kar Diya Gaya Hai!**\n\nAb koi bhi user bina join kiye bot use kar payega.")
+
+# 2. Force Join ON karne ke liye command
+@bot.on_message(filters.command("enablefjoin") & filters.private)
+async def enable_fjoin_cmd(client: Client, message: Message):
+    if int(message.from_user.id) not in OWNER_IDS:
+        return
+    settings_col.update_one(
+        {"type": "force_join_status"},
+        {"$set": {"status": "on"}},
+        upsert=True
+    )
+    await message.reply_text("🟢 **Force Join System Successfully ON Kar Diya Gaya Hai!**\n\nAb users ko bot use karne ke liye channels join karne honge.")
+
 # ================= RESET DATABASE COMMAND (OWNER ONLY) =================
 @bot.on_message(filters.command("resetdb") & filters.private)
 async def reset_database_cmd(client: Client, message: Message):
