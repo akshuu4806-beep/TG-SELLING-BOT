@@ -71,7 +71,8 @@ accounts_col = db["accounts"]  # {phone, price, session_string, 2fa_password, so
 chats_col = db["chats"]        # Groups aur Channels store karne ke liye
 
 settings_col = db["settings"]  # Persistent storage for dynamic configs
-
+# Forced subscription chats ke liye table jisme naam bhi save ho
+db["forced_chats"].create_index("chat_id", unique=True) # Agar MongoDB use kar rahe hain
 
 # Temporary runtime states
 user_states = {}  
@@ -353,16 +354,25 @@ def force_join_keyboard():
     ])
 
 async def get_force_join_channels():
-    """Database se configured force join channels fetch karta hai."""
     config = settings_col.find_one({"type": "force_join"})
     if config and "channels" in config:
-        return config["channels"]  # List of dicts: [{"username": "@channel", "link": "https://..."}]
-    
-    # Fallback to default hardcoded config if DB is empty
+        return config["channels"]
     return [
-        {"username": CHANNEL_USERNAME, "link": CHANNEL_LINK},
-        {"username": GROUP_USERNAME, "link": GROUP_LINK}
+        {"username": CHANNEL_USERNAME, "link": CHANNEL_LINK, "title": "📢 Channel"},
+        {"username": GROUP_USERNAME, "link": GROUP_LINK, "title": "💬 Otp Group"}
     ]
+
+async def build_force_join_keyboard():
+    channels = await get_force_join_channels()
+    buttons = []
+    for idx, ch in enumerate(channels, 1):
+        # Database ya config se fetch kiya gaya custom title (jaise 'Backup Channel')
+        title = ch.get("title") or f"📢 Join Channel {idx}"
+        buttons.append([InlineKeyboardButton(title, url=ch["link"])])
+    
+    buttons.append([InlineKeyboardButton("✅ Verify / Check Join", callback_data="check_force_join")])
+    return InlineKeyboardMarkup(buttons)
+    
 
 async def is_user_joined(client: Client, user_id: int) -> bool:
     # 🔴 Check if Force Join is globally disabled by owner
@@ -433,18 +443,6 @@ async def is_user_joined(client: Client, user_id: int) -> bool:
             return False
 
     return True
-    
-    
-async def build_force_join_keyboard():
-    channels = await get_force_join_channels()
-    buttons = []
-    for idx, ch in enumerate(channels, 1):
-        # Agar custom title set hai toh wo use karo, warna default 'Join Channel X'
-        title = ch.get("title") or f"📢 Join Channel {idx}"
-        buttons.append([InlineKeyboardButton(title, url=ch["link"])])
-    
-    buttons.append([InlineKeyboardButton("✅ Verify / Check Join", callback_data="check_force_join")])
-    return InlineKeyboardMarkup(buttons)
 
 # ================= START COMMAND =================
 @bot.on_message(filters.command("start"))
@@ -876,7 +874,7 @@ async def add_fjoin_cmd(client: Client, message: Message):
         await message.reply_text(
             "⚠️ **Format:**\n`/addfjoin @username_or_chatid | https://t.me/invite_link | Display Name`\n\n"
             "**Example:**\n"
-            "`/addfjoin @itz_darkX | https://t.me/itz_darkX | 📢 Join Main Channel`"
+            "`/addfjoin @itz_darkX | https://t.me/itz_darkX | 📢 Backup Channel`"
         )
         return
 
@@ -886,14 +884,7 @@ async def add_fjoin_cmd(client: Client, message: Message):
     title = parts[2] if len(parts) > 2 else f"📢 Join Channel"
 
     config = settings_col.find_one({"type": "force_join"})
-    
-    if not config or "channels" not in config:
-        channels = [
-            {"username": CHANNEL_USERNAME, "link": CHANNEL_LINK, "title": "📢 Join Channel 1"},
-            {"username": GROUP_USERNAME, "link": GROUP_LINK, "title": "💬 Join OTP Group"}
-        ]
-    else:
-        channels = config.get("channels", [])
+    channels = config.get("channels", []) if config else []
 
     if any(c["username"] == username for c in channels):
         await message.reply_text("⚠️ Yeh channel/group pehle se Force Join list me hai!")
@@ -904,10 +895,11 @@ async def add_fjoin_cmd(client: Client, message: Message):
     
     await message.reply_text(
         f"✅ **Force Join Added Successfully!**\n\n"
-        f"📛 **Button Name:** {title}\n"
+        f"📛 **Name/Title:** {title}\n"
         f"📢 **Target:** `{username}`\n"
         f"🔗 **Link:** {link}"
     )
+    
 
 # 2. View Current Force Join List
 @bot.on_message(filters.command("fjoinlist") & filters.private)
