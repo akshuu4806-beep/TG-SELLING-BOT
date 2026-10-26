@@ -1809,7 +1809,7 @@ async def handle_text(event: events.NewMessage.Event):
         ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
         sender = await event.get_sender()
         username_str = f"@{sender.username}" if sender.username else "N/A"
-        user_mention = sender.mention
+        user_mention = sender.first_name or "User"
         profile_text = (
             f"👤 **USER PROFILE**\n\n"
             f"👤 **Name:** {user_mention}\n"
