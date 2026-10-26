@@ -1,5 +1,5 @@
-pyrogram
-tgcrypto
+telethon
+cryptg
 pymongo
 google-genai
 qrcode
