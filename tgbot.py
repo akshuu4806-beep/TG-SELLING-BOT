@@ -326,8 +326,8 @@ def main_keyboard():
     return ReplyKeyboardMarkup(
         rows=[
             [
-                KeyboardButton("💳 Deposit", style=KeyboardButtonStyle(bg_primary=True)),
-                KeyboardButton("🛒 Buy", style=KeyboardButtonStyle(bg_success=True))
+                KeyboardButton("💳 Deposit Money", style=KeyboardButtonStyle(bg_primary=True)),
+                KeyboardButton("🛒 Buy Account", style=KeyboardButtonStyle(bg_success=True))
             ],
             [
                 KeyboardButton("👤 Profile", style=KeyboardButtonStyle(bg_primary=True)),
@@ -342,7 +342,6 @@ def main_keyboard():
         selective=False,
         persistent=True
     )
-
 
 def logout_keyboard():
     return [[Button.inline("🔴 Logout Bot Session", b"customer_logout")]]
@@ -1390,7 +1389,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             except Exception as e:
                 print(f"OTP group log err: {e}")
 
-            except Exception as e:
+        except Exception as e:
             print(f"🚨 AUTO VERIFY CRASH: {e}")
             import traceback
             traceback.print_exc()
