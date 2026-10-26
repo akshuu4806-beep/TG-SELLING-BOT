@@ -6,3 +6,5 @@ qrcode
 pycountry
 aiohttp
 pillow
+python-dotenv
+dnspython
