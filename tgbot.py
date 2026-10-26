@@ -130,7 +130,7 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
     for _ in range(len(API_KEYS)):
         for model_name in models_to_try:
             try:
-                response = await ai_client.aio.models.generate_content(...)
+                response = await ai_client.aio.models.generate_content(
                     model=model_name,
                     contents=[
                         prompt,
