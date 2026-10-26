@@ -21,6 +21,7 @@ from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannel
 from telethon.tl.functions.messages import GetHistoryRequest, GetFullChatRequest, CheckChatInviteRequest
 from telethon.tl.functions.messages import GetChatInviteImportersRequest
 from telethon.tl.types import ChannelParticipantsSearch, InputPeerChannel, InputPeerChat
+from telethon.tl.types import ReplyKeyboardMarkup, KeyboardButton, KeyboardButtonStyle
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -125,34 +126,45 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
         "Respond ONLY with valid JSON with keys: upi_txn_id, customer_upi, date, time, amount, receiver, is_valid_ss."
     )
 
-    models_to_try = ['gemini-3.8-flash', 'gemini-1.5-flash']
+    # ✅ FIXED: sahi model names (gemini-2.0-flash-exp + gemini-1.5-flash)
+    models_to_try = ['gemini-2.0-flash-exp', 'gemini-1.5-flash']
 
-    for _ in range(len(API_KEYS)):
-        for model_name in models_to_try:
-            try:
-                response = await ai_client.aio.models.generate_content(
+    for attempt in range(len(API_KEYS) * len(models_to_try)):
+        model_name = models_to_try[attempt % len(models_to_try)]
+        try:
+            # ✅ FIXED: 25 sec timeout
+            response = await asyncio.wait_for(
+                ai_client.aio.models.generate_content(
                     model=model_name,
                     contents=[
                         prompt,
                         genai.types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg")
                     ]
-                )
-                cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
-                data = json.loads(cleaned_text)
-                return data
-            except Exception as e:
-                err_msg = str(e)
-                print(f"Gemini OCR Error with Key index {current_key_index} ({model_name}): {err_msg}")
-                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "NOT_FOUND" in err_msg:
-                    current_key_index = (current_key_index + 1) % len(API_KEYS)
-                    ai_client = genai.Client(api_key=API_KEYS[current_key_index])
-                    print(f"🔄 Switching to next Gemini API Key (Index: {current_key_index})")
-                    break
-                if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                    await asyncio.sleep(1.5)
-                    continue
-                break
+                ),
+                timeout=25.0
+            )
+            cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(cleaned_text)
+            print(f"✅ AI success with {model_name} (key {current_key_index})")
+            return data
 
+        except asyncio.TimeoutError:
+            print(f"⏰ AI TIMEOUT with {model_name} (key {current_key_index}) — trying next")
+        except Exception as e:
+            err_msg = str(e)
+            print(f"❌ AI error [{model_name}] key {current_key_index}: {err_msg[:200]}")
+
+            # Sirf quota/rate limit pe key switch karo
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                current_key_index = (current_key_index + 1) % len(API_KEYS)
+                ai_client = genai.Client(api_key=API_KEYS[current_key_index])
+                print(f"🔄 Switched to API key index {current_key_index}")
+
+        # Chhota delay to avoid hammering
+        await asyncio.sleep(0.3)
+
+    # Sab fail ho gaya
+    print("🚨 AI FAILED COMPLETELY — returning default")
     return {"is_valid_ss": False, "upi_txn_id": None, "customer_upi": None,
             "date": None, "time": None, "amount": None, "receiver": None}
 
@@ -311,11 +323,25 @@ async def cleanup_session(session_path: str, active_client=None):
 
 # ================= KEYBOARDS =================
 def main_keyboard():
-    return [
-        [Button.text("💳 Deposit Money"), Button.text("🛒 Buy Account")],
-        [Button.text("👤 Profile"), Button.text("📊 Stats")],
-        [Button.text("🛠️ Support")]
-    ]
+    return ReplyKeyboardMarkup(
+        rows=[
+            [
+                KeyboardButton("💳 Deposit", style=KeyboardButtonStyle(bg_primary=True)),
+                KeyboardButton("🛒 Buy", style=KeyboardButtonStyle(bg_success=True))
+            ],
+            [
+                KeyboardButton("👤 Profile", style=KeyboardButtonStyle(bg_primary=True)),
+                KeyboardButton("📊 Stats", style=KeyboardButtonStyle(bg_success=True))
+            ],
+            [
+                KeyboardButton("🛠️ Support", style=KeyboardButtonStyle(bg_danger=True))
+            ]
+        ],
+        resize=True,
+        single_use=False,
+        selective=False,
+        persistent=True
+    )
 
 
 def logout_keyboard():
@@ -461,24 +487,24 @@ async def start_cmd(event: events.NewMessage.Event):
         )
     else:
         stylish_welcome_text = (
-            f"╔══════════════════════════╗\n"
-            f"║   💎 **WELCOME TO** 💎   ║\n"
-            f"║   **{bot_name}**          \n"
-            f"╚══════════════════════════╝\n\n"
-            f"👋 **Welcome, {first_name}!**\n\n"
+            f"<b>╔══════════════════════╗</b>\n"
+            f"<b>║   💎 WELCOME TO 💎   ║</b>\n"
+            f"<b>║   {bot_name}</b>\n"
+            f"<b>╚══════════════════════╝</b>\n\n"
+            f"👋 Hey <b>{first_name}</b>, welcome aboard!\n\n"
+            f"<blockquote>"
+            f"🎁 <b>REFER & EARN</b>\n"
+            f"🟢 <b>Bonus Rate:</b> <code>2% Instant Cashback</code>\n"
+            f"🔵 <b>Kaise:</b> Jab dost wallet deposit karega, 2% bonus seedhe aapko milega\n"
+            f"🟡 <b>Unlimited:</b> Jitna refer karoge, utna zyada profit"
+            f"</blockquote>\n\n"
+            f"🔗 <b>Your Referral Link:</b>\n"
+            f"<code>{ref_link}</code>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💎 **REFER & EARN PROGRAM** 💎\n"
-            f"├ 🎁 **Bonus Rate:** `2% Instant Cashback`\n"
-            f"├ 💸 **Kaise Kamayein:** Jab bhi aapka dost wallet me deposit karega, 2% bonus seedhe aapke wallet me add ho jayega!\n"
-            f"└ 📊 **Unlimited Earnings:** Jitna refer karoge, utna zyada profit!\n\n"
-            f"🔗 **Your Referral Link:**\n"
-            f"`{ref_link}`\n\n"
-            f"⚡ Choose an option below: ⚡\n"
-            f"───────────────"
+            f"⚡ <b>Choose an option below:</b> ⚡"
         )
 
-    await event.reply(stylish_welcome_text, buttons=main_keyboard(), link_preview=False)
-
+    await event.reply(stylish_welcome_text, buttons=main_keyboard(), link_preview=False, parse_mode='html')
 
 @bot.on(events.NewMessage(pattern=r"^/setstartmsg"))
 async def set_start_msg_cmd(event: events.NewMessage.Event):
@@ -1231,183 +1257,237 @@ async def callback_handler(event: events.CallbackQuery.Event):
         return
 
     elif data.startswith("do_auto_verify_"):
-        parts = data.split("_")
-        amount = float(parts[3])
-        state = get_state(user_id)
-        photo_file_id = state.get("pending_photo_id")
-        qr_gen_time = state.get("qr_generated_at")
-        if not photo_file_id:
-            await event.answer("❌ Session expired ya photo nahi mili! Kripya dobara deposit try karein.", alert=True)
-            return
-        msg_wait = await event.edit("🔍 Bot screenshot verify kar raha hai, kripya intezaar karein...")
-        # Download media
-        photo_bytes = await bot.download_media(photo_file_id, file=bytes)
-        details = await extract_ss_details(photo_bytes)
-        upi_txn_id = details.get("upi_txn_id")
-        customer_upi = details.get("customer_upi") or "N/A"
-        ss_date = details.get("date"); ss_time = details.get("time")
-        ss_amount = details.get("amount"); ss_receiver = details.get("receiver")
-        is_valid = details.get("is_valid_ss")
+        try:
+            parts = data.split("_")
+            amount = float(parts[3])
+            state = get_state(user_id)
+            photo_file_id = state.get("pending_photo_id")
+            qr_gen_time = state.get("qr_generated_at")
 
-        if not is_valid or not upi_txn_id or not ss_date or not ss_time:
-            state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit(
-                "❌ **Galt ya Adhoora Screenshot!**\n\n"
-                "Transaction ID, Date ya Time saaf nahi dikh raha hai.\n\n"
-                "👉 **Kripya apna real aur saaf payment screenshot yahin dobara send karein:**"
-            )
-            return
-
-        if ss_amount is not None and float(ss_amount) != float(amount):
-            state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit(
-                f"❌ **Amount Mismatch!** Aapne ₹{amount} ki request dali thi par SS me ₹{ss_amount} hai.\n\n"
-                "👉 **Kripya sahi amount ka real screenshot dobara send karein:**"
-            )
-            return
-
-        if qr_gen_time and ss_date and ss_time:
-            ss_dt = parse_ss_datetime(ss_date, ss_time)
-            if not ss_dt or ss_dt < qr_gen_time:
-                state["state"] = "awaiting_deposit_ss"
-                await msg_wait.edit(
-                    "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai ya time match nahi hua (Purana SS).\n\n"
-                    "👉 **Kripya naya payment karke uska fresh screenshot bhejien:**"
-                )
+            if not photo_file_id:
+                await event.answer("❌ Session expired ya photo nahi mili!", alert=True)
                 return
-        else:
-            state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit(
-                "❌ **Time Verification Failed!** Screenshot se payment ka time read nahi ho paya.\n\n"
-                "👉 **Kripya saaf screenshot dobara send karein:**"
-            )
-            return
 
-        if ss_receiver and UPI_ID:
-            clean_ss_recv = re.sub(r'[\s@._-]', '', str(ss_receiver)).lower()
-            clean_bot_upi = re.sub(r'[\s@._-]', '', str(UPI_ID)).lower()
-            bot_handle = clean_bot_upi.split()[0] if clean_bot_upi else ""
-            if clean_bot_upi not in clean_ss_recv and clean_ss_recv not in clean_bot_upi and bot_handle not in clean_ss_recv:
+            msg_wait = await event.edit("🔍 Bot screenshot verify kar raha hai, kripya intezaar karein...")
+
+            from io import BytesIO
+            _buf = BytesIO()
+            await bot.download_media(photo_file_id, file=_buf)
+            photo_bytes = _buf.getvalue()
+            print(f"📸 Downloaded {len(photo_bytes)} bytes")
+
+            details = await extract_ss_details(photo_bytes)
+            upi_txn_id = details.get("upi_txn_id")
+            customer_upi = details.get("customer_upi") or "N/A"
+            ss_date = details.get("date")
+            ss_time = details.get("time")
+            ss_amount = details.get("amount")
+            ss_receiver = details.get("receiver")
+            is_valid = details.get("is_valid_ss")
+
+            if not is_valid or not upi_txn_id or not ss_date or not ss_time:
                 state["state"] = "awaiting_deposit_ss"
                 await msg_wait.edit(
-                    f"❌ **Wrong Receiver UPI!** Yeh payment kisi aur ke UPI (`{ss_receiver}`) par bheja gaya hai, hamare UPI par nahi.\n\n"
-                    "👉 **Kripya sahi UPI par payment karke uska naya screenshot send karein:**"
+                    "❌ **Galt ya Adhoora Screenshot!**\n\n"
+                    "Transaction ID, Date ya Time saaf nahi dikh raha hai.\n\n"
+                    "👉 **Kripya apna real aur saaf payment screenshot yahin dobara send karein:**"
                 )
                 return
 
-        existing_txn = db["deposits"].find_one({"upi_txn_id": upi_txn_id if upi_txn_id else "NONE"})
-        if existing_txn:
-            state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit(
-                "❌ **Duplicate Transaction ID!** Yeh UTR pehle hi use ho chuki hai.\n\n"
-                "👉 **Kripya naya screenshot dobara send karein:**"
-            )
-            return
+            if ss_amount is not None and float(ss_amount) != float(amount):
+                state["state"] = "awaiting_deposit_ss"
+                await msg_wait.edit(
+                    f"❌ **Amount Mismatch!** Aapne ₹{amount} ki request dali thi par SS me ₹{ss_amount} hai.\n\n"
+                    "👉 **Kripya sahi amount ka real screenshot dobara send karein:**"
+                )
+                return
 
-        db["deposits"].insert_one({
-            "user_id": user_id, "upi_txn_id": upi_txn_id, "customer_upi": customer_upi,
-            "amount": amount, "date": ss_date, "time": ss_time,
-            "status": "approved", "approved_by": "Automatic Bot Click"
-        })
-        users_col.update_one({"user_id": user_id}, {"$inc": {"wallet": amount, "total_deposited": amount}})
-        target_user = users_col.find_one({"user_id": user_id})
-        referrer_id = target_user.get("referred_by") if target_user else None
-        if referrer_id:
-            commission = (amount * 2) / 100
-            users_col.update_one({"user_id": int(referrer_id)},
-                                 {"$inc": {"wallet": commission, "referral_profit": commission}})
+            if qr_gen_time and ss_date and ss_time:
+                ss_dt = parse_ss_datetime(ss_date, ss_time)
+                if not ss_dt or ss_dt < qr_gen_time:
+                    state["state"] = "awaiting_deposit_ss"
+                    await msg_wait.edit(
+                        "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai ya time match nahi hua (Purana SS).\n\n"
+                        "👉 **Kripya naya payment karke uska fresh screenshot bhejien:**"
+                    )
+                    return
+            else:
+                state["state"] = "awaiting_deposit_ss"
+                await msg_wait.edit(
+                    "❌ **Time Verification Failed!** Screenshot se payment ka time read nahi ho paya.\n\n"
+                    "👉 **Kripya saaf screenshot dobara send karein:**"
+                )
+                return
+
+            if ss_receiver and UPI_ID:
+                clean_ss_recv = re.sub(r'[\s@._-]', '', str(ss_receiver)).lower()
+                clean_bot_upi = re.sub(r'[\s@._-]', '', str(UPI_ID)).lower()
+                bot_handle = clean_bot_upi.split()[0] if clean_bot_upi else ""
+                if clean_bot_upi not in clean_ss_recv and clean_ss_recv not in clean_bot_upi and bot_handle not in clean_ss_recv:
+                    state["state"] = "awaiting_deposit_ss"
+                    await msg_wait.edit(
+                        f"❌ **Wrong Receiver UPI!** Yeh payment kisi aur ke UPI (`{ss_receiver}`) par bheja gaya hai, hamare UPI par nahi.\n\n"
+                        "👉 **Kripya sahi UPI par payment karke uska naya screenshot send karein:**"
+                    )
+                    return
+
+            existing_txn = db["deposits"].find_one({"upi_txn_id": upi_txn_id if upi_txn_id else "NONE"})
+            if existing_txn:
+                state["state"] = "awaiting_deposit_ss"
+                await msg_wait.edit(
+                    "❌ **Duplicate Transaction ID!** Yeh UTR pehle hi use ho chuki hai.\n\n"
+                    "👉 **Kripya naya screenshot dobara send karein:**"
+                )
+                return
+
+            db["deposits"].insert_one({
+                "user_id": user_id, "upi_txn_id": upi_txn_id, "customer_upi": customer_upi,
+                "amount": amount, "date": ss_date, "time": ss_time,
+                "status": "approved", "approved_by": "Automatic Bot Click"
+            })
+            users_col.update_one({"user_id": user_id}, {"$inc": {"wallet": amount, "total_deposited": amount}})
+            target_user = users_col.find_one({"user_id": user_id})
+            referrer_id = target_user.get("referred_by") if target_user else None
+            if referrer_id:
+                commission = (amount * 2) / 100
+                users_col.update_one({"user_id": int(referrer_id)},
+                                     {"$inc": {"wallet": commission, "referral_profit": commission}})
+                try:
+                    await bot.send_message(referrer_id,
+                        f"🎉 Referral commission received! Referred user deposited ₹{amount}, you got ₹{commission:.2f} bonus.")
+                except Exception:
+                    pass
+
+            success_text = (
+                f"🎉 **Deposit Auto-Approved Successfully!**\n\n"
+                f"💰 **Amount Added:** ₹{amount}\n"
+                f"🔢 **Txn ID:** `{upi_txn_id or 'N/A'}`\n"
+                f"✨ Aapka payment successfully verify karke wallet me add kar diya gaya hai!"
+            )
+            await msg_wait.edit(success_text)
+
+            masked_sender_upi = mask_upi_id(customer_upi)
+            now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+            auto_date_str = now.strftime("%d-%m-%Y")
+            auto_time_str = now.strftime("%I:%M:%S %p")
+            approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
+            group_msg = (
+                f"🎉 **Payment Approved Successful (Auto)!**\n\n"
+                f"👤 **User:** {sender.mention}\n"
+                f"🆔 **User ID:** `{user_id}`\n"
+                f"💰 **Amount Added:** ₹{amount}\n"
+                f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"
+                f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
+                f"🤖 **Approved By:** {approved_info}\n\n"
+                f"🤖 **Bot :** @DarktgOtp_bot\n"
+            )
             try:
-                await bot.send_message(referrer_id,
-                    f"🎉 Referral commission received! Referred user deposited ₹{amount}, you got ₹{commission:.2f} bonus.")
+                await bot.send_message(PAYMENT_LOG_GROUP, group_msg)
+            except Exception as e:
+                print(f"Payment group log err: {e}")
+            try:
+                await bot.send_message(OTP_GROUP_ID, group_msg)
+            except Exception as e:
+                print(f"OTP group log err: {e}")
+
+            except Exception as e:
+            print(f"🚨 AUTO VERIFY CRASH: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                await event.answer(f"❌ Verification failed: {str(e)[:100]}", alert=True)
+            except Exception:
+                pass
+            try:
+                await event.edit(
+                    "❌ **Verification me error aa gaya!**\n\n"
+                    "👉 Kripya **Manual Verify** option try karein ya thodi der baad dobara koshish karein."
+                )
             except Exception:
                 pass
 
-        success_text = (
-            f"🎉 **Deposit Auto-Approved Successfully!**\n\n"
-            f"💰 **Amount Added:** ₹{amount}\n"
-            f"🔢 **Txn ID:** `{upi_txn_id or 'N/A'}`\n"
-            f"✨ Aapka payment successfully verify karke wallet me add kar diya gaya hai!"
-        )
-        await msg_wait.edit(success_text)
-        masked_sender_upi = mask_upi_id(customer_upi)
-        now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        auto_date_str = now.strftime("%d-%m-%Y")
-        auto_time_str = now.strftime("%I:%M:%S %p")
-        approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
-        group_msg = (
-            f"🎉 **Payment Approved Successful (Auto)!**\n\n"
-            f"👤 **User:** {sender.mention}\n"
-            f"🆔 **User ID:** `{user_id}`\n"
-            f"💰 **Amount Added:** ₹{amount}\n"
-            f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"
-            f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
-            f"🤖 **Approved By:** {approved_info}\n\n"
-            f"🤖 **Bot :** @DarktgOtp_bot\n"
-        )
-        try:
-            await bot.send_message(PAYMENT_LOG_GROUP, group_msg)
-        except Exception as e:
-            print(f"Payment group log err: {e}")
-        try:
-            await bot.send_message(OTP_GROUP_ID, group_msg)
-        except Exception as e:
-            print(f"OTP group log err: {e}")
-
     elif data.startswith("do_manual_verify_"):
-        parts = data.split("_")
-        amount = float(parts[3])
-        state = get_state(user_id)
-        photo_file_id = state.get("pending_photo_id")
-        if not photo_file_id:
-            await event.answer("❌ Session expired! Kripya dobara try karein.", alert=True)
-            return
-        msg_wait = await event.edit("⏳ Processing manual verification request... It takes 1 to 2 mints")
-        photo_bytes = await bot.download_media(photo_file_id, file=bytes)
-        details = await extract_ss_details(photo_bytes)
-        upi_txn_id = details.get("upi_txn_id") or "N/A"
-        customer_upi = details.get("customer_upi")
-        ss_date = details.get("date") or "N/A"
-        ss_time = details.get("time") or "N/A"
-        db["deposits"].update_one(
-            {"user_id": user_id, "amount": amount, "status": "pending"},
-            {"$set": {
-                "user_id": user_id,
-                "upi_txn_id": upi_txn_id if upi_txn_id != "N/A" else None,
-                "customer_upi": customer_upi if customer_upi else None,
-                "amount": amount, "date": ss_date, "time": ss_time, "status": "pending"
-            }},
-            upsert=True
-        )
         try:
-            await msg_wait.edit(
-                "⏳ **Manual Request Submitted!**\n\n"
-                "Aapka screenshot saari details ke sath admin ke paas bhej diya gaya hai. Kripya thoda intezaar karein."
-            )
-        except Exception:
-            pass
-        username = f"@{sender.username}" if sender.username else "N/A"
-        admin_caption = (
-            f"💵 **New Manual Deposit Request**\n\n"
-            f"👤 **User:** {sender.mention}\n"
-            f"📛 **Username:** {username}\n"
-            f"🆔 **User ID:** `{user_id}`\n"
-            f"💰 **Amount:** ₹{amount}\n"
-            f"🔢 **UPI Txn ID:** `{upi_txn_id}`\n"
-            f"💳 **Customer UPI:** `{customer_upi or 'N/A'}`\n"
-            f"📅 **Txn Date:** `{ss_date}`\n"
-            f"⏰ **Txn Time:** `{ss_time}`"
-        )
-        try:
-            await bot.send_file(
-                chat_id=PAYMENT_LOG_GROUP, file=photo_file_id, caption=admin_caption,
-                buttons=[[
-                    Button.inline("✅ Approve", f"approve_dep_{user_id}_{amount}".encode()),
-                    Button.inline("❌ Reject", f"reject_dep_{user_id}_{amount}".encode())
-                ]]
-            )
-        except Exception as e:
-            print(f"Admin group send err: {e}")
+            parts = data.split("_")
+            amount = float(parts[3])
+            state = get_state(user_id)
+            photo_file_id = state.get("pending_photo_id")
 
+            if not photo_file_id:
+                await event.answer("❌ Session expired! Kripya dobara try karein.", alert=True)
+                return
+
+            msg_wait = await event.edit("⏳ Processing manual verification request... It takes 1 to 2 mints")
+
+            from io import BytesIO
+            _buf = BytesIO()
+            await bot.download_media(photo_file_id, file=_buf)
+            photo_bytes = _buf.getvalue()
+            print(f"📸 [MANUAL] Downloaded {len(photo_bytes)} bytes")
+
+            details = await extract_ss_details(photo_bytes)
+            upi_txn_id = details.get("upi_txn_id") or "N/A"
+            customer_upi = details.get("customer_upi")
+            ss_date = details.get("date") or "N/A"
+            ss_time = details.get("time") or "N/A"
+
+            db["deposits"].update_one(
+                {"user_id": user_id, "amount": amount, "status": "pending"},
+                {"$set": {
+                    "user_id": user_id,
+                    "upi_txn_id": upi_txn_id if upi_txn_id != "N/A" else None,
+                    "customer_upi": customer_upi if customer_upi else None,
+                    "amount": amount, "date": ss_date, "time": ss_time, "status": "pending"
+                }},
+                upsert=True
+            )
+            try:
+                await msg_wait.edit(
+                    "⏳ **Manual Request Submitted!**\n\n"
+                    "Aapka screenshot saari details ke sath admin ke paas bhej diya gaya hai. Kripya thoda intezaar karein."
+                )
+            except Exception:
+                pass
+
+            username = f"@{sender.username}" if sender.username else "N/A"
+            admin_caption = (
+                f"💵 **New Manual Deposit Request**\n\n"
+                f"👤 **User:** {sender.mention}\n"
+                f"📛 **Username:** {username}\n"
+                f"🆔 **User ID:** `{user_id}`\n"
+                f"💰 **Amount:** ₹{amount}\n"
+                f"🔢 **UPI Txn ID:** `{upi_txn_id}`\n"
+                f"💳 **Customer UPI:** `{customer_upi or 'N/A'}`\n"
+                f"📅 **Txn Date:** `{ss_date}`\n"
+                f"⏰ **Txn Time:** `{ss_time}`"
+            )
+            try:
+                await bot.send_file(
+                    chat_id=PAYMENT_LOG_GROUP, file=photo_file_id, caption=admin_caption,
+                    buttons=[[
+                        Button.inline("✅ Approve", f"approve_dep_{user_id}_{amount}".encode()),
+                        Button.inline("❌ Reject", f"reject_dep_{user_id}_{amount}".encode())
+                    ]]
+                )
+            except Exception as e:
+                print(f"Admin group send err: {e}")
+
+        except Exception as e:
+            print(f"🚨 MANUAL VERIFY CRASH: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                await event.answer(f"❌ Manual verification failed: {str(e)[:100]}", alert=True)
+            except Exception:
+                pass
+            try:
+                await event.edit(
+                    "❌ **Manual verification me error aa gaya!**\n\n"
+                    "👉 Kripya thodi der baad dobara try karein ya Support se contact karein."
+                )
+            except Exception:
+                pass
+                
     elif data.startswith("buy_acc_"):
         target_phone = data.replace("buy_acc_", "")
         already_busy = any(s.get("account", {}).get("phone") == target_phone for s in login_states.values())
