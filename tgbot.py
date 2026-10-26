@@ -14,28 +14,24 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 import pycountry
 from io import BytesIO
-from datetime import datetime
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram import Client, filters
-from pyrogram.types import (
-    ReplyKeyboardMarkup, 
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    Message
-)
-from pyrogram.errors import (
-    SessionPasswordNeeded, 
-    PhoneCodeInvalid, 
-    PasswordHashInvalid, 
-    UserNotParticipant,
-    InputUserDeactivated,
-    UserIsBlocked,
-    PeerIdInvalid,
-    ChatAdminRequired,
-    ChannelPrivate
+from datetime import datetime, timedelta, timezone
+
+from telethon import TelegramClient, events, Button, functions, types
+from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
+from telethon.tl.functions.messages import GetHistoryRequest, GetFullChatRequest, CheckChatInviteRequest
+from telethon.tl.functions.messages import GetChatInviteImportersRequest
+from telethon.tl.types import ChannelParticipantsSearch, InputPeerChannel, InputPeerChat
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+    UserNotParticipantError,
+    UserDeactivatedBanError,
+    UserIsBlockedError,
+    PeerIdInvalidError,
+    ChatAdminRequiredError,
+    ChannelPrivateError,
 )
 from pymongo import MongoClient
 
@@ -66,60 +62,57 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["tg_store_bot"]
 
 # Collections
-users_col = db["users"]        # {user_id, wallet}
-accounts_col = db["accounts"]  # {phone, price, session_string, 2fa_password, sold, buyer_id}
-chats_col = db["chats"]        # Groups aur Channels store karne ke liye
-
-settings_col = db["settings"]  # Persistent storage for dynamic configs
-# Forced subscription chats ke liye table jisme naam bhi save ho
-db["forced_chats"].create_index("chat_id", unique=True) # Agar MongoDB use kar rahe hain
+users_col = db["users"]
+accounts_col = db["accounts"]
+chats_col = db["chats"]
+settings_col = db["settings"]
+db["forced_chats"].create_index("chat_id", unique=True)
 
 # Temporary runtime states
-user_states = {}  
-login_states = {} 
+user_states = {}
+login_states = {}
 
-bot = Client("StoreBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-# Gemini API Keys (Environment variable se fetch hongi)
+# Telethon bot client (session string optional for bot)
+bot = TelegramClient("StoreBot", API_ID, API_HASH)
+
+# Gemini API Keys
 raw_api_keys = os.getenv("API_KEYS", "")
 API_KEYS = [k.strip() for k in raw_api_keys.split(",") if k.strip()]
 
-# Agar Render par API_KEYS set nahi ki hongi toh bot error dega taaki aapko pata chale
 if not API_KEYS:
     raise ValueError("❌ Error: API_KEYS environment variable is missing!")
 
 current_key_index = 0
 ai_client = genai.Client(api_key=API_KEYS[current_key_index])
-# Helper functions
 
 # ================= SESSION LOCK MANAGER =================
-_session_locks: dict = {}       # {session_name: asyncio.Lock}
-_busy_phones: set = set()       # Currently in-use phones
+_session_locks: dict = {}
+_busy_phones: set = set()
 
-from datetime import datetime, timedelta, timezone
 
 def get_formatted_time():
     now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     date_str = now.strftime("%d-%m-%Y")
     time_str = now.strftime("%I:%M:%S %p")
     return date_str, time_str
-    
+
+
 def mask_upi_id(upi: str) -> str:
     if not upi or "@" not in upi:
         return "N/A"
     parts = upi.split("@")
     name = parts[0]
     domain = parts[1]
-    
     if len(name) <= 3:
         masked_name = name[0] + "*" * (len(name) - 1)
     else:
         masked_name = name[:2] + "*" * (len(name) - 4) + name[-2:]
-        
     return f"{masked_name}@{domain}"
+
 
 async def extract_ss_details(photo_bytes: bytes) -> dict:
     global current_key_index, ai_client
-    
+
     prompt = (
         "Analyze this payment screenshot. Extract details in JSON format:\n"
         "1. 'upi_txn_id': UPI transaction ID / UTR / Reference No (null if missing).\n"
@@ -131,11 +124,9 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
         "7. 'is_valid_ss': true if it's a valid successful payment receipt with transaction IDs, date and time, else false.\n\n"
         "Respond ONLY with valid JSON with keys: upi_txn_id, customer_upi, date, time, amount, receiver, is_valid_ss."
     )
-    
-    # Stable aur supported models list
+
     models_to_try = ['gemini-3.8-flash', 'gemini-1.5-flash']
 
-    # Saari keys ke liye loop chalega
     for _ in range(len(API_KEYS)):
         for model_name in models_to_try:
             try:
@@ -152,25 +143,21 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
             except Exception as e:
                 err_msg = str(e)
                 print(f"Gemini OCR Error with Key index {current_key_index} ({model_name}): {err_msg}")
-                
-                # Agar Quota exhaust hua hai ya koi limit error hai, toh agli key par switch karo
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "NOT_FOUND" in err_msg:
                     current_key_index = (current_key_index + 1) % len(API_KEYS)
                     ai_client = genai.Client(api_key=API_KEYS[current_key_index])
                     print(f"🔄 Switching to next Gemini API Key (Index: {current_key_index})")
-                    break  # Agli key ke sath loop dobara try karega
-                
+                    break
                 if "503" in err_msg or "UNAVAILABLE" in err_msg:
                     await asyncio.sleep(1.5)
                     continue
                 break
 
-    return {"is_valid_ss": False, "upi_txn_id": None, "customer_upi": None, "date": None, "time": None, "amount": None, "receiver": None}
+    return {"is_valid_ss": False, "upi_txn_id": None, "customer_upi": None,
+            "date": None, "time": None, "amount": None, "receiver": None}
+
 
 def parse_ss_datetime(date_str: str, time_str: str):
-    """
-    Date aur Time strings ko datetime object me convert karta hai.
-    """
     if not date_str or not time_str:
         return None
     try:
@@ -184,33 +171,35 @@ def parse_ss_datetime(date_str: str, time_str: str):
         print(f"Datetime parse error: {e}")
     return None
 
+
 async def cleanup_user_login(user_id: int):
-    """Pending login session ko clear karta hai aur phone number ko unbusy karta hai."""
     if user_id in login_states:
         session_data = login_states.pop(user_id, None)
         if session_data:
             acc = session_data.get("account", {})
             target_phone = acc.get("phone")
             if target_phone:
-                _busy_phones.discard(target_phone)  # Phone release ho gaya
-            
+                _busy_phones.discard(target_phone)
             client_obj = session_data.get("client")
             if client_obj:
                 await safe_disconnect(client_obj)
+
 
 def _lock_for(name: str) -> asyncio.Lock:
     if name not in _session_locks:
         _session_locks[name] = asyncio.Lock()
     return _session_locks[name]
 
+
 async def safe_disconnect(client):
     if not client:
         return
     try:
-        if client.is_connected:
+        if client.is_connected():
             await client.disconnect()
     except Exception as e:
         print(f"disconnect err: {e}")
+
 
 def get_available_countries(acc_type: str = "fresh"):
     pipeline = [
@@ -219,7 +208,6 @@ def get_available_countries(acc_type: str = "fresh"):
                 "sold": False,
                 "$or": [
                     {"type": acc_type},
-                    # Agar purana account hai jisme 'type' missing tha, usko default 'fresh' maano
                     {"type": {"$exists": False}} if acc_type == "fresh" else {"_id": None}
                 ]
             }
@@ -234,18 +222,17 @@ def get_available_countries(acc_type: str = "fresh"):
     ]
     return list(accounts_col.aggregate(pipeline))
 
+
 def mask_phone_number(phone: str, country_code: str = None) -> str:
     phone_clean = re.sub(r'[\s\-\(\)]', '', phone)
     if not phone_clean.startswith('+'):
         phone_clean = '+' + phone_clean
 
-    # DB ka country_code use karo (jo add karte time save hua tha)
     cc = country_code.strip() if country_code else ""
     if not cc.startswith('+'):
         cc = '+' + cc
     cc = cc.strip()
 
-    # Agar country_code empty ya invalid ho, phone se guess karo (fallback)
     if not cc or cc == '+':
         if phone_clean.startswith('+91'):
             cc = '+91'
@@ -256,25 +243,16 @@ def mask_phone_number(phone: str, country_code: str = None) -> str:
 
     last_three = phone_clean[-3:]
     hidden_len = len(phone_clean) - len(cc) - 3
-
     if hidden_len < 1:
         return f"{cc}{'*' * 3}{last_three}"
     return f"{cc}{'*' * hidden_len}{last_three}"
 
+
 def get_flag_emoji(country_name: str) -> str:
-    # Custom mapping common short forms ke liye
-    custom_flags = {
-        "usa": "🇺🇸",
-        "us": "🇺🇸",
-        "uk": "🇬🇧",
-        "uae": "🇦🇪",
-        "india": "🇮🇳"
-    }
-    
+    custom_flags = {"usa": "🇺🇸", "us": "🇺🇸", "uk": "🇬🇧", "uae": "🇦🇪", "india": "🇮🇳"}
     clean_name = country_name.strip().lower()
     if clean_name in custom_flags:
         return custom_flags[clean_name]
-
     try:
         country = pycountry.countries.search_fuzzy(country_name)[0]
         iso = country.alpha_2.upper()
@@ -282,11 +260,13 @@ def get_flag_emoji(country_name: str) -> str:
     except Exception:
         return "🌍"
 
+
 def extract_otp(text: str) -> str:
     match = re.search(r'\b\d{5,6}\b', text)
     if match:
         return match.group(0)
     return "NOT-FOUND"
+
 
 def get_user(user_id, referrer_id=None):
     user = users_col.find_one({"user_id": user_id})
@@ -303,11 +283,11 @@ def get_user(user_id, referrer_id=None):
         users_col.insert_one(user)
     return user
 
+
 def get_state(user_id):
     if user_id not in user_states:
         user_states[user_id] = {"state": None, "deposit_amount": 0.0}
     return user_states[user_id]
-
 
 
 async def cleanup_session(session_path: str, active_client=None):
@@ -315,10 +295,8 @@ async def cleanup_session(session_path: str, active_client=None):
     async with lock:
         if active_client:
             await safe_disconnect(active_client)
-
         gc.collect()
-        await asyncio.sleep(0.2)  # OS ko handle release karne ka time do
-
+        await asyncio.sleep(0.2)
         full_path = f"{session_path}.session"
         if os.path.exists(full_path):
             for attempt in range(5):
@@ -330,28 +308,27 @@ async def cleanup_session(session_path: str, active_client=None):
                         print(f"Could not remove locked session file (giving up): {full_path}")
                     await asyncio.sleep(0.5)
 
+
 # ================= KEYBOARDS =================
 def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("💳 Deposit Money"), KeyboardButton("🛒 Buy Account")],
-            [KeyboardButton("👤 Profile"), KeyboardButton("📊 Stats")],
-            [KeyboardButton("🛠️ Support")]
-        ],
-        resize_keyboard=True
-    )
+    return [
+        [Button.text("💳 Deposit Money"), Button.text("🛒 Buy Account")],
+        [Button.text("👤 Profile"), Button.text("📊 Stats")],
+        [Button.text("🛠️ Support")]
+    ]
+
 
 def logout_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Logout Bot Session", callback_data="customer_logout")]
-    ])
+    return [[Button.inline("🔴 Logout Bot Session", b"customer_logout")]]
+
 
 def force_join_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Channel", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("💬 Otp Group", url=GROUP_LINK)],
-        [InlineKeyboardButton("✅ Verify / Check Join", callback_data="check_force_join")]
-    ])
+    return [
+        [Button.url("📢 Channel", CHANNEL_LINK)],
+        [Button.url("💬 Otp Group", GROUP_LINK)],
+        [Button.inline("✅ Verify / Check Join", b"check_force_join")]
+    ]
+
 
 async def get_force_join_channels():
     config = settings_col.find_one({"type": "force_join"})
@@ -362,42 +339,35 @@ async def get_force_join_channels():
         {"username": GROUP_USERNAME, "link": GROUP_LINK, "title": "💬 Otp Group"}
     ]
 
+
 async def build_force_join_keyboard():
     channels = await get_force_join_channels()
     buttons = []
     for idx, ch in enumerate(channels, 1):
-        # Database ya config se fetch kiya gaya custom title (jaise 'Backup Channel')
         title = ch.get("title") or f"📢 Join Channel {idx}"
-        buttons.append([InlineKeyboardButton(title, url=ch["link"])])
-    
-    buttons.append([InlineKeyboardButton("✅ Verify / Check Join", callback_data="check_force_join")])
-    return InlineKeyboardMarkup(buttons)
-    
+        buttons.append([Button.url(title, ch["link"])])
+    buttons.append([Button.inline("✅ Verify / Check Join", b"check_force_join")])
+    return buttons
 
-async def is_user_joined(client: Client, user_id: int) -> bool:
-    # 🔴 Check if Force Join is globally disabled by owner
+
+async def is_user_joined(client: TelegramClient, user_id: int) -> bool:
     status_config = settings_col.find_one({"type": "force_join_status"})
     if status_config and status_config.get("status") == "off":
         return True
-        
+
     channels = await get_force_join_channels()
     for ch in channels:
         target = str(ch.get("username", "")).strip()
         link = str(ch.get("link", "")).strip()
-        
-        # Identifier extract logic
         chat_identifier = None
-        
-        # 1. Check if target is integer ID like -1003944403417
+
         if target.startswith("-100") or (target.startswith("-") and target[1:].isdigit()) or target.isdigit():
             try:
                 chat_identifier = int(target)
             except ValueError:
                 chat_identifier = target
-        # 2. Check if username starts with @
         elif target.startswith("@"):
             chat_identifier = target
-        # 3. Handle t.me links
         elif "t.me/" in target:
             clean_part = target.split("t.me/")[-1].replace("/", "")
             if clean_part.startswith("+") or "joinchat" in clean_part:
@@ -407,35 +377,41 @@ async def is_user_joined(client: Client, user_id: int) -> bool:
         else:
             chat_identifier = "@" + target if not target.startswith("+") else target
 
-        # Step A: Member check
         is_verified = False
         try:
-            member = await client.get_chat_member(chat_identifier, user_id)
-            if member.status not in ["left", "kicked", "banned"]:
+            entity = await client.get_entity(chat_identifier)
+            try:
+                await client(functions.channels.GetParticipantRequest(entity, user_id))
                 is_verified = True
-        except UserNotParticipant:
-            is_verified = False
+            except Exception:
+                is_verified = False
         except Exception as e:
             print(f"Direct member check failed for {chat_identifier}: {e}")
 
-        # Step B: If not direct member, check Join Requests
         if not is_verified:
             try:
-                async for req in client.get_chat_join_requests(chat_identifier):
-                    if req.user.id == user_id:
-                        is_verified = True
-                        break
+                entity = await client.get_entity(chat_identifier)
+                if isinstance(entity, types.Channel):
+                    result = await client(GetChatInviteImportersRequest(
+                        peer=entity, requested=True, offset_date=None, offset_user=types.InputUserEmpty(), limit=200
+                    ))
+                    for imp in result.importers:
+                        if imp.user_id == user_id:
+                            is_verified = True
+                            break
             except Exception as req_err:
                 print(f"Join Request check error for {chat_identifier}: {req_err}")
 
-        # Step C: Fallback check with link/username
         if not is_verified and link and link != target:
             try:
                 fallback_target = link.split("t.me/")[-1].replace("/", "")
                 if not fallback_target.startswith("+"):
-                    member = await client.get_chat_member("@" + fallback_target, user_id)
-                    if member.status not in ["left", "kicked", "banned"]:
+                    entity = await client.get_entity("@" + fallback_target)
+                    try:
+                        await client(functions.channels.GetParticipantRequest(entity, user_id))
                         is_verified = True
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -444,16 +420,18 @@ async def is_user_joined(client: Client, user_id: int) -> bool:
 
     return True
 
+
 # ================= START COMMAND =================
-@bot.on_message(filters.command("start"))
-async def start_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    first_name = message.from_user.first_name
-    
+@bot.on(events.NewMessage(pattern=r"^/start"))
+async def start_cmd(event: events.NewMessage.Event):
+    user_id = event.sender_id
+    first_name = (await event.get_sender()).first_name
+
     referrer_id = None
-    if len(message.command) > 1:
+    parts = event.text.split()
+    if len(parts) > 1:
         try:
-            raw_ref = message.command[1]
+            raw_ref = parts[1]
             clean_ref = raw_ref.replace("REF", "").replace("4F886", "").strip()
             possible_ref = int(clean_ref)
             if possible_ref != user_id:
@@ -463,32 +441,25 @@ async def start_cmd(client: Client, message: Message):
 
     get_user(user_id, referrer_id)
 
-    # Dynamic Force Join Check
-    if not await is_user_joined(client, user_id):
+    if not await is_user_joined(bot, user_id):
         keyboard = await build_force_join_keyboard()
-        await message.reply_text(
+        await event.reply(
             f"👋 **Welcome {first_name}!**\n\n"
             "⚠️ **Bot access karne ke liye pehle hamare Channels/Groups ko join karein:**",
-            reply_markup=keyboard
+            buttons=keyboard
         )
         return
 
-    bot_info = await client.get_me()
-    bot_name = bot_info.first_name.upper()
-    ref_link = f"https://t.me/{bot_info.username}?start=REF{user_id}4F886"
+    me = await bot.get_me()
+    bot_name = me.first_name.upper()
+    ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
 
-    # Database se check karna ki koi custom message set hai ya nahi
     custom_config = settings_col.find_one({"type": "custom_start_message"})
-    
     if custom_config and "message" in custom_config:
-        # Agar custom message set hai toh variables replace karke wahi bhejenge
         stylish_welcome_text = custom_config["message"].format(
-            first_name=first_name,
-            bot_name=bot_name,
-            ref_link=ref_link
+            first_name=first_name, bot_name=bot_name, ref_link=ref_link
         )
     else:
-        # Default Welcome Message agar koi custom set nahi hai
         stylish_welcome_text = (
             f"╔══════════════════════════╗\n"
             f"║   💎 **WELCOME TO** 💎   ║\n"
@@ -506,21 +477,16 @@ async def start_cmd(client: Client, message: Message):
             f"───────────────"
         )
 
-    await message.reply_text(
-        text=stylish_welcome_text,
-        reply_markup=main_keyboard(),
-        disable_web_page_preview=True
-    )
-    
-# Custom Start Message Set karne ke liye command
-@bot.on_message(filters.command("setstartmsg") & filters.private)
-async def set_start_msg_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
-        return
+    await event.reply(stylish_welcome_text, buttons=main_keyboard(), link_preview=False)
 
-    input_text = message.text.split(maxsplit=1)
+
+@bot.on(events.NewMessage(pattern=r"^/setstartmsg"))
+async def set_start_msg_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
+        return
+    input_text = event.text.split(maxsplit=1)
     if len(input_text) < 2:
-        await message.reply_text(
+        await event.reply(
             "⚠️ **Format:**\n"
             "`/setstartmsg Aapka naya welcome message yahan likhein...`\n\n"
             "Aap isme variables use kar sakte hain:\n"
@@ -529,270 +495,232 @@ async def set_start_msg_cmd(client: Client, message: Message):
             "- `{ref_link}`: Referral link"
         )
         return
-
     new_msg = input_text[1].strip()
-    
-    # MongoDB me save karna
-    settings_col.update_one(
-        {"type": "custom_start_message"},
-        {"$set": {"message": new_msg}},
-        upsert=True
-    )
-    await message.reply_text("✅ **Custom Start Message Successfully Set Ho Gaya Hai!**")
+    settings_col.update_one({"type": "custom_start_message"}, {"$set": {"message": new_msg}}, upsert=True)
+    await event.reply("✅ **Custom Start Message Successfully Set Ho Gaya Hai!**")
 
-# Default Start Message par wapas laane ke liye command
-@bot.on_message(filters.command("resetstartmsg") & filters.private)
-async def reset_start_msg_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+
+@bot.on(events.NewMessage(pattern=r"^/resetstartmsg"))
+async def reset_start_msg_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
-    # Database se custom message delete/reset karna
     settings_col.delete_one({"type": "custom_start_message"})
-    await message.reply_text("🔄 **Start Message Reset Ho Kar Default Wala Ho Gaya Hai!**")
-    
-@bot.on_message(filters.command("add") & filters.private)
-async def add_single_acc_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    if int(user_id) not in OWNER_IDS:
+    await event.reply("🔄 **Start Message Reset Ho Kar Default Wala Ho Gaya Hai!**")
+
+
+@bot.on(events.NewMessage(pattern=r"^/add$"))
+async def add_single_acc_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
+    keyboard = [
+        [Button.inline("🔥 Spam Account", b"add_type_spam"),
+         Button.inline("🌱 Fresh Account", b"add_type_fresh")],
+        [Button.inline("🆕 New Registered", b"add_type_registered")]
+    ]
+    await event.reply("🌍 **[Owner]** Select Account Type:", buttons=keyboard)
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔥 Spam Account", callback_data="add_type_spam"),
-            InlineKeyboardButton("🌱 Fresh Account", callback_data="add_type_fresh")
-        ],
-        [
-            InlineKeyboardButton("🆕 New Registered", callback_data="add_type_registered")
-        ]
-    ])
-    await message.reply_text("🌍 **[Owner]** Select Account Type:", reply_markup=keyboard)
 
-@bot.on_chat_join_request()
-async def on_join_request(client: Client, chat_join_request):
-    user_id = chat_join_request.from_user.id
-    chat_id = chat_join_request.chat.id
-    
-    # Store join request state in DB for fast lookup
-    db["join_requests"].update_one(
-        {"user_id": user_id, "chat_id": chat_id},
-        {"$set": {"user_id": user_id, "chat_id": chat_id, "timestamp": datetime.now()}},
-        upsert=True
-    )
+@bot.on(events.ChatAction())
+async def on_join_request(event):
+    """Telethon join request tracking via ChatAction / Raw events"""
+    try:
+        if event.user_joined or event.user_added:
+            user_id = event.user_id
+            chat_id = event.chat_id
+            db["join_requests"].update_one(
+                {"user_id": user_id, "chat_id": chat_id},
+                {"$set": {"user_id": user_id, "chat_id": chat_id, "timestamp": datetime.now()}},
+                upsert=True
+            )
+    except Exception:
+        pass
 
-# ================= CREDIT & DEBIT COMMANDS (OWNER ONLY) =================
-@bot.on_message(filters.command("credit") & filters.private)
-async def credit_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+
+# ================= CREDIT & DEBIT =================
+@bot.on(events.NewMessage(pattern=r"^/credit"))
+async def credit_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
-    args = message.text.split(maxsplit=2)
+    args = event.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.reply_text(
-            "⚠️ **Format:**\n"
-            "`/credit <user_id_or_username> <amount>`\n\n"
-            "**Example:**\n"
-            "`/credit 123456789 500`\n"
-            "`/credit @username 200`"
+        await event.reply(
+            "⚠️ **Format:**\n`/credit <user_id_or_username> <amount>`\n\n"
+            "**Example:**\n`/credit 123456789 500`\n`/credit @username 200`"
         )
         return
-
     target_identifier = args[1].strip()
     try:
         amount = float(args[2].strip())
         if amount <= 0:
-            await message.reply_text("❌ Amount 0 se zyada honi chahiye!")
+            await event.reply("❌ Amount 0 se zyada honi chahiye!")
             return
     except ValueError:
-        await message.reply_text("❌ Invalid amount! Kripya sahi number dalein.")
+        await event.reply("❌ Invalid amount! Kripya sahi number dalein.")
         return
 
-    # Target user ko find karna (UserID ya Username se)
     query = {}
     if target_identifier.startswith("@"):
-        # Username se find karne ke liye agar chat history me available ho
         user_doc = users_col.find_one({"username": target_identifier.replace("@", "").lower()})
-        # Alternately pyrogram se user info nikal sakte hain
         try:
-            resolved_user = await client.get_users(target_identifier)
+            resolved_user = await bot.get_entity(target_identifier)
             query = {"user_id": resolved_user.id}
             target_user_id = resolved_user.id
             target_name = resolved_user.first_name
         except Exception:
-            await message.reply_text("❌ Yeh username Telegram par nahi mila ya user ne bot start nahi kiya hai.")
+            await event.reply("❌ Yeh username Telegram par nahi mila ya user ne bot start nahi kiya hai.")
             return
     else:
         try:
             target_user_id = int(target_identifier)
             query = {"user_id": target_user_id}
-            resolved_user = await client.get_users(target_user_id)
+            resolved_user = await bot.get_entity(target_user_id)
             target_name = resolved_user.first_name
         except ValueError:
-            await message.reply_text("❌ Invalid User ID!")
+            await event.reply("❌ Invalid User ID!")
             return
         except Exception:
             target_name = "User"
 
-    # Wallet Update
-    target_user_data = get_user(target_user_id)
+    get_user(target_user_id)
     users_col.update_one(query, {"$inc": {"wallet": amount}})
-    
     updated_user = users_col.find_one(query)
     new_balance = updated_user.get("wallet", 0.0)
 
-    await message.reply_text(
+    await event.reply(
         f"✅ **Successfully Credited!**\n\n"
         f"👤 **User:** {target_name} (`{target_user_id}`)\n"
         f"💰 **Added Amount:** ₹{amount}\n"
         f"💳 **New Wallet Balance:** ₹{new_balance:.2f}"
     )
-
-    # User ko notification bhejna
     try:
-        await bot.send_message(
-            target_user_id,
+        await bot.send_message(target_user_id,
             f"🎁 **Your Wallet Has Been Credited!**\n\n"
             f"💰 **Amount Added:** ₹{amount}\n"
             f"💳 **Current Wallet Balance:** ₹{new_balance:.2f}\n"
-            f"👑 **Credited By:** Owner"
-        )
+            f"👑 **Credited By:** Owner")
     except Exception:
         pass
 
 
-@bot.on_message(filters.command("debit") & filters.private)
-async def debit_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+@bot.on(events.NewMessage(pattern=r"^/debit"))
+async def debit_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
-    args = message.text.split(maxsplit=2)
+    args = event.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.reply_text(
-            "⚠️ **Format:**\n"
-            "`/debit <user_id_or_username> <amount>`\n\n"
-            "**Example:**\n"
-            "`/debit 123456789 200`\n"
-            "`/debit @username 100`"
+        await event.reply(
+            "⚠️ **Format:**\n`/debit <user_id_or_username> <amount>`\n\n"
+            "**Example:**\n`/debit 123456789 200`\n`/debit @username 100`"
         )
         return
-
     target_identifier = args[1].strip()
     try:
         amount = float(args[2].strip())
         if amount <= 0:
-            await message.reply_text("❌ Amount 0 se zyada honi chahiye!")
+            await event.reply("❌ Amount 0 se zyada honi chahiye!")
             return
     except ValueError:
-        await message.reply_text("❌ Invalid amount! Kripya sahi number dalein.")
+        await event.reply("❌ Invalid amount! Kripya sahi number dalein.")
         return
 
-    # Target user ko find karna (UserID ya Username se)
     query = {}
     if target_identifier.startswith("@"):
         try:
-            resolved_user = await client.get_users(target_identifier)
+            resolved_user = await bot.get_entity(target_identifier)
             query = {"user_id": resolved_user.id}
             target_user_id = resolved_user.id
             target_name = resolved_user.first_name
         except Exception:
-            await message.reply_text("❌ Yeh username Telegram par nahi mila ya user ne bot start nahi kiya hai.")
+            await event.reply("❌ Yeh username Telegram par nahi mila ya user ne bot start nahi kiya hai.")
             return
     else:
         try:
             target_user_id = int(target_identifier)
             query = {"user_id": target_user_id}
-            resolved_user = await client.get_users(target_user_id)
+            resolved_user = await bot.get_entity(target_user_id)
             target_name = resolved_user.first_name
         except ValueError:
-            await message.reply_text("❌ Invalid User ID!")
+            await event.reply("❌ Invalid User ID!")
             return
         except Exception:
             target_name = "User"
 
-    target_user_data = get_user(target_user_id)
+    get_user(target_user_id)
+    target_user_data = users_col.find_one(query)
     current_balance = target_user_data.get("wallet", 0.0)
-
-    # Balance kam karne se pehle check karna ki sufficient balance hai ya nahi (optional, chahein toh negative me bhi jaane de sakte hain)
     new_balance = current_balance - amount
-
     users_col.update_one(query, {"$set": {"wallet": new_balance}})
 
-    await message.reply_text(
+    await event.reply(
         f"✅ **Successfully Debited!**\n\n"
         f"👤 **User:** {target_name} (`{target_user_id}`)\n"
         f"💸 **Deducted Amount:** ₹{amount}\n"
         f"💳 **New Wallet Balance:** ₹{new_balance:.2f}"
     )
-
-    # User ko notification bhejna
     try:
-        await bot.send_message(
-            target_user_id,
+        await bot.send_message(target_user_id,
             f"⚠️ **Your Wallet Has Been Debited!**\n\n"
             f"💸 **Deducted Amount:** ₹{amount}\n"
             f"💳 **Current Wallet Balance:** ₹{new_balance:.2f}\n"
-            f"👑 **Debited By:** Owner"
-        )
+            f"👑 **Debited By:** Owner")
     except Exception:
         pass
 
-# ================= TRACK CHATS & GROUPS =================
-@bot.on_chat_member_updated()
-async def on_chat_member_update(client: Client, chat_member):
+
+# ================= TRACK CHATS =================
+@bot.on(events.ChatAction())
+async def on_chat_member_update(event):
     try:
-        bot_id = (await client.get_me()).id
-        if chat_member.new_chat_member and chat_member.new_chat_member.user.id == bot_id:
-            chat = chat_member.chat
-            chat_title = chat.title or str(chat.id)
+        me = await bot.get_me()
+        if event.user_id == me.id and (event.user_added or event.user_joined):
+            chat = await event.get_chat()
+            chat_title = getattr(chat, "title", str(event.chat_id))
             chats_col.update_one(
-                {"chat_id": chat.id},
-                {"$set": {
-                    "chat_id": chat.id,
-                    "title": chat_title,
-                    "type": str(chat.type)
-                }},
+                {"chat_id": event.chat_id},
+                {"$set": {"chat_id": event.chat_id, "title": chat_title, "type": type(chat).__name__}},
                 upsert=True
             )
     except Exception as e:
         print(f"Error tracking chat member update: {e}")
 
-@bot.on_message((filters.group | filters.channel) & ~filters.private)
-async def track_chats(client: Client, message: Message):
-    chat_title = message.chat.title or str(message.chat.id)
-    chats_col.update_one(
-        {"chat_id": message.chat.id},
-        {"$set": {
-            "chat_id": message.chat.id, 
-            "title": chat_title, 
-            "type": str(message.chat.type)
-        }},
-        upsert=True
-    )
 
-# ================= BULK ADD HANDLER =================
-@bot.on_message(filters.command("addbulk") & filters.private)
-async def add_bulk_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    if int(user_id) not in OWNER_IDS:
+@bot.on(events.NewMessage())
+async def track_chats(event: events.NewMessage.Event):
+    if event.is_private:
         return
+    try:
+        chat = await event.get_chat()
+        chat_title = getattr(chat, "title", str(event.chat_id))
+        chats_col.update_one(
+            {"chat_id": event.chat_id},
+            {"$set": {"chat_id": event.chat_id, "title": chat_title, "type": type(chat).__name__}},
+            upsert=True
+        )
+    except Exception:
+        pass
 
-    input_text = message.text.split(maxsplit=1)
+
+# ================= BULK ADD =================
+@bot.on(events.NewMessage(pattern=r"^/addbulk"))
+async def add_bulk_cmd(event: events.NewMessage.Event):
+    user_id = event.sender_id
+    if user_id not in OWNER_IDS:
+        return
+    input_text = event.text.split(maxsplit=1)
     if len(input_text) < 2:
-        await message.reply_text(
+        await event.reply(
             "⚠️ **Format:**\n\n"
             "`/addbulk`\n"
             "`India|+91|50|+919876543210|pass1|spam`\n"
             "`India|+91|50|+919876543211|none|fresh`"
         )
         return
-
     lines = input_text[1].strip().split("\n")
     queue = []
-
     for line in lines:
         parts = [p.strip() for p in line.split("|")]
         if len(parts) >= 4:
-            c_name = parts[0]
-            c_code = parts[1]
+            c_name = parts[0]; c_code = parts[1]
             try:
                 price = float(parts[2])
             except ValueError:
@@ -800,52 +728,35 @@ async def add_bulk_cmd(client: Client, message: Message):
             phone = parts[3]
             password = parts[4] if len(parts) > 4 and parts[4].lower() != "none" else None
             acc_type = parts[5].lower() if len(parts) > 5 and parts[5].lower() in ["spam", "fresh", "registered"] else "fresh"
-            
-            queue.append({
-                "c_name": c_name, "c_code": c_code, 
-                "price": price, "phone": phone, "password": password,
-                "type": acc_type
-            })
-
+            queue.append({"c_name": c_name, "c_code": c_code, "price": price,
+                          "phone": phone, "password": password, "type": acc_type})
     if not queue:
-        await message.reply_text("❌ Valid numbers nahi mile format me!")
+        await event.reply("❌ Valid numbers nahi mile format me!")
         return
+    user_states[user_id] = {"bulk_queue": queue, "completed": 0, "total": len(queue)}
+    await process_next_bulk_account(bot, user_id, event)
 
-    user_states[user_id] = {
-        "bulk_queue": queue,
-        "completed": 0,
-        "total": len(queue)
-    }
 
-    await process_next_bulk_account(client, user_id, message)
-
-# ================= OWNER LOGOUT COMMAND =================
-@bot.on_message(filters.command("logout") & filters.private)
-async def logout_acc_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    if int(user_id) not in OWNER_IDS:
+# ================= OWNER LOGOUT =================
+@bot.on(events.NewMessage(pattern=r"^/logout"))
+async def logout_acc_cmd(event: events.NewMessage.Event):
+    user_id = event.sender_id
+    if user_id not in OWNER_IDS:
         return
-
-    input_text = message.text.split(maxsplit=1)
+    input_text = event.text.split(maxsplit=1)
     if len(input_text) < 2:
-        await message.reply_text("⚠️ **Format:** `/logout <phone_number>`\nExample: `/logout +919876543210`")
+        await event.reply("⚠️ **Format:** `/logout <phone_number>`\nExample: `/logout +919876543210`")
         return
-
     target_phone = input_text[1].strip()
     acc = accounts_col.find_one({"phone": target_phone})
-
     if not acc:
-        await message.reply_text(f"❌ Account `{target_phone}` database me nahi mila!")
+        await event.reply(f"❌ Account `{target_phone}` database me nahi mila!")
         return
-
-    status_msg = await message.reply_text(f"⏳ Logging out account `{target_phone}`...")
-
+    status_msg = await event.reply(f"⏳ Logging out account `{target_phone}`...")
     session_name = f"sessions/{target_phone.replace('+', '').replace(' ', '')}"
-    temp_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
-
+    temp_client = TelegramClient(session_name, API_ID, API_HASH)
     try:
-        if not temp_client.is_connected:
-            await temp_client.connect()
+        await temp_client.connect()
         try:
             await temp_client.log_out()
         except Exception:
@@ -854,168 +765,119 @@ async def logout_acc_cmd(client: Client, message: Message):
         pass
     finally:
         await cleanup_session(session_name, temp_client)
-        
-        # STOCK REMOVAL LOGIC: sold: True set kar rahe hain taaki stock se hat jaye
-        accounts_col.update_one(
-            {"phone": target_phone}, 
-            {"$set": {"sold": True, "status": "logged_out"}}
-        )
+        accounts_col.update_one({"phone": target_phone}, {"$set": {"sold": True, "status": "logged_out"}})
+    await status_msg.edit(f"✅ **Account `{target_phone}` logged out and removed from stock!**")
 
-    await status_msg.edit_text(f"✅ **Account `{target_phone}` logged out and removed from stock!**")
 
-# 1. Add Force Join Channel/Group
-@bot.on_message(filters.command("addfjoin") & filters.private)
-async def add_fjoin_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+# ================= FORCE JOIN =================
+@bot.on(events.NewMessage(pattern=r"^/addfjoin"))
+async def add_fjoin_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
-    input_text = message.text.split(maxsplit=1)
+    input_text = event.text.split(maxsplit=1)
     if len(input_text) < 2 or "|" not in input_text[1]:
-        await message.reply_text(
+        await event.reply(
             "⚠️ **Format:**\n`/addfjoin @username_or_chatid | https://t.me/invite_link | Display Name`\n\n"
-            "**Example:**\n"
-            "`/addfjoin @itz_darkX | https://t.me/itz_darkX | 📢 Backup Channel`"
+            "**Example:**\n`/addfjoin @itz_darkX | https://t.me/itz_darkX | 📢 Backup Channel`"
         )
         return
-
     parts = [p.strip() for p in input_text[1].split("|")]
-    username = parts[0]
-    link = parts[1]
-    title = parts[2] if len(parts) > 2 else f"📢 Join Channel"
-
+    username = parts[0]; link = parts[1]
+    title = parts[2] if len(parts) > 2 else "📢 Join Channel"
     config = settings_col.find_one({"type": "force_join"})
     channels = config.get("channels", []) if config else []
-
     if any(c["username"] == username for c in channels):
-        await message.reply_text("⚠️ Yeh channel/group pehle se Force Join list me hai!")
+        await event.reply("⚠️ Yeh channel/group pehle se Force Join list me hai!")
         return
-
     channels.append({"username": username, "link": link, "title": title})
     settings_col.update_one({"type": "force_join"}, {"$set": {"channels": channels}}, upsert=True)
-    
-    await message.reply_text(
+    await event.reply(
         f"✅ **Force Join Added Successfully!**\n\n"
         f"📛 **Name/Title:** {title}\n"
         f"📢 **Target:** `{username}`\n"
         f"🔗 **Link:** {link}"
     )
-    
 
-# 2. View Current Force Join List
-@bot.on_message(filters.command("fjoinlist") & filters.private)
-async def list_fjoin_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+
+@bot.on(events.NewMessage(pattern=r"^/fjoinlist"))
+async def list_fjoin_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
     channels = await get_force_join_channels()
     if not channels:
-        await message.reply_text("ℹ️ Abhi koi bhi Force Join channel set nahi hai.")
+        await event.reply("ℹ️ Abhi koi bhi Force Join channel set nahi hai.")
         return
-
     text = "📢 **CURRENT FORCE JOIN CHANNELS/GROUPS:**\n\n"
     for idx, ch in enumerate(channels, 1):
         text += f"{idx}. **Target:** `{ch['username']}`\n   🔗 **Link:** {ch['link']}\n\n"
-    
-    await message.reply_text(text)
+    await event.reply(text)
 
-# 3. Reset/Clear All Force Join Limits
-# 3. Reset/Clear Specific Force Join Channel by Username/Link
-@bot.on_message(filters.command("clearfjoin") & filters.private)
-async def clear_fjoin_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+
+@bot.on(events.NewMessage(pattern=r"^/clearfjoin"))
+async def clear_fjoin_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
-    input_text = message.text.split(maxsplit=1)
+    input_text = event.text.split(maxsplit=1)
     if len(input_text) < 2:
-        await message.reply_text(
-            "⚠️ **Format:**\n`/clearfjoin @username_or_link`\n\n"
-            "**Example:**\n"
-            "`/clearfjoin @itz_darkX`"
-        )
+        await event.reply("⚠️ **Format:**\n`/clearfjoin @username_or_link`\n\n**Example:**\n`/clearfjoin @itz_darkX`")
         return
-
     target = input_text[1].strip()
     config = settings_col.find_one({"type": "force_join"})
-    
     if not config or "channels" not in config:
-        await message.reply_text("ℹ️ Koi bhi Force Join channel set nahi hai.")
+        await event.reply("ℹ️ Koi bhi Force Join channel set nahi hai.")
         return
-
     channels = config.get("channels", [])
-    
-    # Target username ya link se match karke remove karna
     new_channels = [c for c in channels if c["username"] != target and c["link"] != target]
-
     if len(new_channels) == len(channels):
-        await message.reply_text(f"❌ '{target}' se milta hua koi bhi channel/group list me nahi mila!")
+        await event.reply(f"❌ '{target}' se milta hua koi bhi channel/group list me nahi mila!")
         return
-
     settings_col.update_one({"type": "force_join"}, {"$set": {"channels": new_channels}}, upsert=True)
-    await message.reply_text(f"✅ **Success!** `{target}` ko Force Join list se hata diya gaya hai.")
+    await event.reply(f"✅ **Success!** `{target}` ko Force Join list se hata diya gaya hai.")
 
-# 1. Force Join OFF karne ke liye command
-@bot.on_message(filters.command("disablefjoin") & filters.private)
-async def disable_fjoin_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+
+@bot.on(events.NewMessage(pattern=r"^/disablefjoin"))
+async def disable_fjoin_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-    settings_col.update_one(
-        {"type": "force_join_status"},
-        {"$set": {"status": "off"}},
-        upsert=True
-    )
-    await message.reply_text("🔴 **Force Join System Successfully OFF Kar Diya Gaya Hai!**\n\nAb koi bhi user bina join kiye bot use kar payega.")
+    settings_col.update_one({"type": "force_join_status"}, {"$set": {"status": "off"}}, upsert=True)
+    await event.reply("🔴 **Force Join System Successfully OFF Kar Diya Gaya Hai!**\n\nAb koi bhi user bina join kiye bot use kar payega.")
 
-# 2. Force Join ON karne ke liye command
-@bot.on_message(filters.command("enablefjoin") & filters.private)
-async def enable_fjoin_cmd(client: Client, message: Message):
-    if int(message.from_user.id) not in OWNER_IDS:
+
+@bot.on(events.NewMessage(pattern=r"^/enablefjoin"))
+async def enable_fjoin_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-    settings_col.update_one(
-        {"type": "force_join_status"},
-        {"$set": {"status": "on"}},
-        upsert=True
-    )
-    await message.reply_text("🟢 **Force Join System Successfully ON Kar Diya Gaya Hai!**\n\nAb users ko bot use karne ke liye channels join karne honge.")
+    settings_col.update_one({"type": "force_join_status"}, {"$set": {"status": "on"}}, upsert=True)
+    await event.reply("🟢 **Force Join System Successfully ON Kar Diya Gaya Hai!**\n\nAb users ko bot use karne ke liye channels join karne honge.")
 
-# ================= RESET DATABASE COMMAND (OWNER ONLY) =================
-@bot.on_message(filters.command("resetdb") & filters.private)
-async def reset_database_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    if int(user_id) not in OWNER_IDS:
+
+@bot.on(events.NewMessage(pattern=r"^/resetdb"))
+async def reset_database_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
     try:
-        # Saare collections ka data delete karna
         users_col.delete_many({})
         accounts_col.delete_many({})
         chats_col.delete_many({})
-
-        # Local runtime memory state clear karna
         user_states.clear()
         login_states.clear()
-
-        await message.reply_text("🧹 **MongoDB Successfully Reset!**\n\nSaare Users, Accounts Stock, aur Chat logs delete ho chuke hain.")
+        await event.reply("🧹 **MongoDB Successfully Reset!**\n\nSaare Users, Accounts Stock, aur Chat logs delete ho chuke hain.")
     except Exception as e:
-        await message.reply_text(f"❌ Reset karne me error aaya: `{e}`")
+        await event.reply(f"❌ Reset karne me error aaya: `{e}`")
 
-async def process_next_bulk_account(client, user_id, message_or_cb):
+
+async def process_next_bulk_account(client, user_id, event_or_msg):
     state = user_states.get(user_id)
     if not state or not state.get("bulk_queue"):
         completed = state.get("completed", 0) if state else 0
         total = state.get("total", 0) if state else 0
         text = f"🎉 **Bulk Process Completed!**\nTotal Added: `{completed}/{total}`"
-        
-        if hasattr(message_or_cb, "reply_text"):
-            await message_or_cb.reply_text(text)
-        else:
-            await message_or_cb.message.reply_text(text)
-        
+        await event_or_msg.reply(text)
         user_states.pop(user_id, None)
         return
 
     current_acc = state["bulk_queue"].pop(0)
     phone = current_acc["phone"]
-
     session_folder = "sessions"
     os.makedirs(session_folder, exist_ok=True)
     session_name = f"{session_folder}/{phone.replace('+', '').replace(' ', '')}"
@@ -1026,23 +888,21 @@ async def process_next_bulk_account(client, user_id, message_or_cb):
     else:
         await cleanup_session(session_name)
 
-    acc_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
-
+    acc_client = TelegramClient(session_name, API_ID, API_HASH)
     existing = accounts_col.find_one({"phone": phone, "status": {"$ne": "logged_out"}})
     if existing:
-        await message_or_cb.reply_text(
+        await event_or_msg.reply(
             f"⚠️ `{phone}` already DB me hai (Type: {existing.get('type','fresh')}). "
             f"Pehle `/logout {phone}` karo."
         )
         state["state"] = None
         await cleanup_session(session_name, acc_client)
-        await process_next_bulk_account(client, user_id, message_or_cb)
+        await process_next_bulk_account(client, user_id, event_or_msg)
         return
-    
+
     try:
         await acc_client.connect()
-        sent_code = await acc_client.send_code(phone)
-        
+        sent_code = await acc_client.send_code_request(phone)
         state["state"] = "awaiting_bulk_otp"
         state["current_acc"] = current_acc
         state["temp_client"] = acc_client
@@ -1055,211 +915,159 @@ async def process_next_bulk_account(client, user_id, message_or_cb):
             f"💰 **Price:** ₹{current_acc['price']}\n\n"
             f"📩 **Enter OTP for `{phone}`:**"
         )
-        if hasattr(message_or_cb, "reply_text"):
-            await message_or_cb.reply_text(status_text)
-        else:
-            await message_or_cb.message.reply_text(status_text)
-
+        await event_or_msg.reply(status_text)
     except Exception as e:
         await cleanup_session(session_name, acc_client)
-        err_text = f"❌ Error for `{phone}`: {str(e)}\nSkipping to next..."
-        if hasattr(message_or_cb, "reply_text"):
-            await message_or_cb.reply_text(err_text)
-        else:
-            await message_or_cb.message.reply_text(err_text)
-        
-        await process_next_bulk_account(client, user_id, message_or_cb)
+        await event_or_msg.reply(f"❌ Error for `{phone}`: {str(e)}\nSkipping to next...")
+        await process_next_bulk_account(client, user_id, event_or_msg)
 
-# ================= STOCK CHECK COMMAND =================
-@bot.on_message(filters.command("stock") & filters.private)
-async def stock_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    if int(user_id) not in OWNER_IDS:
+
+# ================= STOCK CHECK =================
+@bot.on(events.NewMessage(pattern=r"^/stock"))
+async def stock_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
         return
-
-    # Aggregate stock details by country and type
     pipeline = [
         {"$match": {"sold": False}},
-        {
-            "$group": {
-                "_id": {
-                    "country": "$country_name",
-                    "code": "$country_code",
-                    "type": {"$ifNull": ["$type", "fresh"]}
-                },
-                "count": {"$sum": 1}
-            }
-        },
+        {"$group": {
+            "_id": {"country": "$country_name", "code": "$country_code", "type": {"$ifNull": ["$type", "fresh"]}},
+            "count": {"$sum": 1}
+        }},
         {"$sort": {"_id.country": 1}}
     ]
-    
     stock_data = list(accounts_col.aggregate(pipeline))
     total_unsold = accounts_col.count_documents({"sold": False})
     total_sold = accounts_col.count_documents({"sold": True})
-
     if not stock_data:
-        await message.reply_text("📊 **STOCK STATUS**\n\n❌ Database me abhi koi unsold account nahi hai!")
+        await event.reply("📊 **STOCK STATUS**\n\n❌ Database me abhi koi unsold account nahi hai!")
         return
-
-    # Country-wise stats gather karna
     formatted_stock = {}
     for item in stock_data:
-        c_name = item["_id"]["country"]
-        c_code = item["_id"]["code"]
-        acc_type = str(item["_id"]["type"]).upper()
-        count = item["count"]
-
+        c_name = item["_id"]["country"]; c_code = item["_id"]["code"]
+        acc_type = str(item["_id"]["type"]).upper(); count = item["count"]
         key = f"{c_name} ({c_code})"
         if key not in formatted_stock:
             formatted_stock[key] = {"FRESH": 0, "SPAM": 0, "REGISTERED": 0}
-        
         formatted_stock[key][acc_type] = count
-
-    # Response text create karna
     text = "📊 **OWNER STOCK SUMMARY**\n\n"
     text += f"🟢 **Total Unsold Stock:** `{total_unsold}`\n"
     text += f"🔴 **Total Sold Out:** `{total_sold}`\n"
     text += "────────────────────\n\n"
-
     for country_info, types in formatted_stock.items():
-        fresh_cnt = types.get("FRESH", 0)
-        spam_cnt = types.get("SPAM", 0)
-        reg_cnt = types.get("REGISTERED", 0)
-        
         text += f"🌍 **{country_info}**\n"
-        text += f"   ├── 🌱 Fresh: `{fresh_cnt}`\n"
-        text += f"   ├── 🔥 Spam: `{spam_cnt}`\n"
-        text += f"   └── 🆕 Registered: `{reg_cnt}`\n\n"
+        text += f"   ├── 🌱 Fresh: `{types.get('FRESH', 0)}`\n"
+        text += f"   ├── 🔥 Spam: `{types.get('SPAM', 0)}`\n"
+        text += f"   └── 🆕 Registered: `{types.get('REGISTERED', 0)}`\n\n"
+    await event.reply(text)
 
-    await message.reply_text(text)
-    
-# ================= BROADCAST HANDLER =================
-@bot.on_message(filters.command(["broadcast", "gcast"]) & filters.user(OWNER_IDS))
-async def broadcast_cmd(client: Client, message: Message):
-    target_msg = message.reply_to_message if message.reply_to_message else message
 
-    if target_msg == message and len(message.command) < 2:
-        await message.reply_text(
+# ================= BROADCAST =================
+@bot.on(events.NewMessage(pattern=r"^/(broadcast|gcast)"))
+async def broadcast_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
+        return
+    reply_msg = await event.get_reply_message()
+    if not reply_msg and len(event.text.split(maxsplit=1)) < 2:
+        await event.reply(
             "⚠️ **Broadcast Command Usage:**\n\n"
             "1. Kisi bhi message (Photo, Video, Text, Sticker) ko **reply** karke likhein: `/broadcast`\n"
             "2. Direct message ke liye likhein: `/broadcast Yahan apna text likhein`"
         )
         return
-
-    status_msg = await message.reply_text("📢 **Broadcast Process Started...**")
-
+    status_msg = await event.reply("📢 **Broadcast Process Started...**")
     all_users = list(users_col.find({}, {"user_id": 1}))
     all_chats = list(chats_col.find({}, {"chat_id": 1}))
-
-    targets = list(set([u["user_id"] for u in all_users if "user_id" in u] + [c["chat_id"] for c in all_chats if "chat_id" in c]))
-
-    success = 0
-    failed = 0
-
+    targets = list(set([u["user_id"] for u in all_users if "user_id" in u] +
+                       [c["chat_id"] for c in all_chats if "chat_id" in c]))
+    success = 0; failed = 0
     for chat_id in targets:
         try:
-            if message.reply_to_message:
-                await target_msg.copy(chat_id)
+            if reply_msg:
+                await reply_msg.forward_to(chat_id)
             else:
-                broadcast_text = message.text.split(maxsplit=1)[1]
-                await client.send_message(chat_id, broadcast_text)
-            
+                broadcast_text = event.text.split(maxsplit=1)[1]
+                await bot.send_message(chat_id, broadcast_text)
             success += 1
             await asyncio.sleep(0.05)
-
-        except (InputUserDeactivated, UserIsBlocked, PeerIdInvalid):
+        except (UserDeactivatedBanError, UserIsBlockedError, PeerIdInvalidError):
             users_col.delete_one({"user_id": chat_id})
             chats_col.delete_one({"chat_id": chat_id})
             failed += 1
-
         except Exception:
             failed += 1
-
-    await status_msg.edit_text(
+    await status_msg.edit(
         f"✅ **Broadcast Completed Successfully!**\n\n"
         f"🟢 **Delivered:** `{success}`\n"
         f"🔴 **Failed/Blocked:** `{failed}`\n"
         f"📊 **Total Attempted:** `{len(targets)}`"
     )
 
+
 # ================= CALLBACK HANDLER =================
-@bot.on_callback_query()
-async def callback_handler(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    data = callback.data
-    
-    # Agar user 'check_force_join' par click kar raha hai toh ise skip karna zaroori hai
+@bot.on(events.CallbackQuery())
+async def callback_handler(event: events.CallbackQuery.Event):
+    user_id = event.sender_id
+    try:
+        data = event.data.decode()
+    except Exception:
+        return
+
+    # Skip force-join check for the verify callback
     if data != "check_force_join":
-        if not await is_user_joined(client, user_id):
+        if not await is_user_joined(bot, user_id):
             keyboard = await build_force_join_keyboard()
             try:
-                await callback.message.edit_text(
+                await event.edit(
                     "⚠️ **Aapne hamare required Channels/Groups ko leave kar diya hai!**\n\n"
                     "Bot use karne ke liye pehle unhe join karein:",
-                    reply_markup=keyboard
+                    buttons=keyboard
                 )
             except Exception:
-                await callback.message.reply_text(
-                    "⚠️ **Aapne channels/groups leave kar diye hain!** Pehle join karein:",
-                    reply_markup=keyboard
-                )
-            await callback.answer("❌ Pehle channels/groups join karein!", show_alert=True)
+                await event.respond("⚠️ **Aapne channels/groups leave kar diye hain!** Pehle join karein:", buttons=keyboard)
+            await event.answer("❌ Pehle channels/groups join karein!", alert=True)
             return
-    
-    state = get_state(user_id)
 
-    is_owner = (int(user_id) in OWNER_IDS)
+    state = get_state(user_id)
+    is_owner = (user_id in OWNER_IDS)
+    user = get_user(user_id)
+    sender = await event.get_sender()
 
     if data == "check_force_join":
-        if await is_user_joined(client, user_id):
-            await callback.answer("✅ Verification successful! Welcome to the bot.", show_alert=True)
-            
-            # Bot details & Dynamic Name fetch
-            bot_info = await client.get_me()
-            bot_name = bot_info.first_name.upper()
-            ref_link = f"https://t.me/{bot_info.username}?start=REF{user_id}4F886"
-
+        if await is_user_joined(bot, user_id):
+            await event.answer("✅ Verification successful! Welcome to the bot.", alert=True)
+            me = await bot.get_me()
+            bot_name = me.first_name.upper()
+            ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
             stylish_welcome_text = (
                 f"╔══════════════════════════╗\n"
                 f"║   💎 **WELCOME TO** 💎   ║\n"
                 f"║   **{bot_name}**          \n"
                 f"╚══════════════════════════╝\n\n"
-                f"👋 **Welcome, {callback.from_user.first_name}!**\n\n"
+                f"👋 **Welcome, {sender.first_name}!**\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💎 **REFER & EARN PROGRAM** 💎\n"
                 f"├ 🎁 **Bonus Rate:** `2% Instant Cashback`\n"
                 f"├ 💸 **Kaise Kamayein:** Jab bhi aapka dost wallet me deposit karega, 2% bonus seedhe aapke wallet me add ho jayega!\n"
                 f"└ 📊 **Unlimited Earnings:** Jitna refer karoge, utna zyada profit!\n\n"
-                f"🔗 **Aapka Referral Link:**\n"
-                f"`{ref_link}`\n\n"
+                f"🔗 **Aapka Referral Link:**\n`{ref_link}`\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━"
             )
-
-            await callback.message.edit_text(
-                text=stylish_welcome_text,
-                disable_web_page_preview=True
-            )
-            # Main keyboard reply me bhejien
-            await callback.message.reply_text(
-                "Select an option from below:",
-                reply_markup=main_keyboard()
-            )
+            await event.edit(stylish_welcome_text, link_preview=False)
+            await event.respond("Select an option from below:", buttons=main_keyboard())
         else:
-            # Refresh Force Join Keyboard
             keyboard = await build_force_join_keyboard()
-            await callback.answer("❌ Aapne abhi tak saare channels/groups join nahi kiye hain!", show_alert=True)
-            await callback.message.edit_text(
-                f"👋 **Welcome, {callback.from_user.first_name}!**\n\n"
+            await event.answer("❌ Aapne abhi tak saare channels/groups join nahi kiye hain!", alert=True)
+            await event.edit(
+                f"👋 **Welcome, {sender.first_name}!**\n\n"
                 "⚠️ **Bot access karne ke liye pehle hamare Channels/Groups ko join karein:**",
-                reply_markup=keyboard
+                buttons=keyboard
             )
         return
 
     elif data == "profile":
-        bot_info = await client.get_me()
-        ref_link = f"https://t.me/{bot_info.username}?start=REF{user_id}4F886"
-        username_str = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
-    
+        me = await bot.get_me()
+        ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
+        username_str = f"@{sender.username}" if sender.username else "N/A"
         profile_text = (
             f"👤 **USER PROFILE**\n\n"
             f"🆔 **User ID:** `{user_id}`\n"
@@ -1269,14 +1077,10 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"🔗 **Your Referral Link:**\n`{ref_link}`\n\n"
             f"🎁 *Har referral deposit ka 2% aapke wallet me auto-credit hoga!*"
         )
-        await callback.message.edit_text(
-            profile_text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
-        )
+        await event.edit(profile_text, buttons=[[Button.inline("🔙 Back", b"back_main")]])
 
     elif data == "stats":
         bought_count = accounts_col.count_documents({"buyer_id": user_id, "sold": True})
-    
         stats_text = (
             f"📊 **YOUR ACCOUNT STATS**\n\n"
             f"🛒 **Total Accounts Bought:** {bought_count}\n"
@@ -1284,12 +1088,11 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"💵 **Total Amount Deposited:** ₹{user.get('total_deposited', 0.0):.2f}\n"
             f"🎁 **Referral Earnings (2%):** ₹{user.get('referral_profit', 0.0):.2f}"
         )
-    
-        stats_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("👥 Referral Log", callback_data="ref_log"), InlineKeyboardButton("🛒 Purchase Log", callback_data="purchase_log")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
-        ])
-        await callback.message.edit_text(stats_text, reply_markup=stats_buttons)
+        stats_buttons = [
+            [Button.inline("👥 Referral Log", b"ref_log"), Button.inline("🛒 Purchase Log", b"purchase_log")],
+            [Button.inline("🔙 Back", b"back_main")]
+        ]
+        await event.edit(stats_text, buttons=stats_buttons)
 
     elif data == "ref_log":
         referred_users = list(users_col.find({"referred_by": user_id}))
@@ -1299,11 +1102,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 text += f"{idx}. User ID: `{ref['user_id']}` | Joined: `{ref.get('start_date', 'N/A')}`\n"
         else:
             text += "Aapne abhi tak kisi ko refer nahi kiya hai."
-        
-        await callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Stats", callback_data="stats")]])
-        )
+        await event.edit(text, buttons=[[Button.inline("🔙 Back to Stats", b"stats")]])
 
     elif data == "purchase_log":
         purchased_accs = list(accounts_col.find({"buyer_id": user_id, "sold": True}))
@@ -1314,323 +1113,233 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 text += f"{idx}. Phone: `{masked_num}` | Price: ₹{acc['price']}\n"
         else:
             text += "Aapne abhi tak koi account buy nahi kiya hai."
-        
-        await callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Stats", callback_data="stats")]])
-        )
+        await event.edit(text, buttons=[[Button.inline("🔙 Back to Stats", b"stats")]])
 
     elif data == "support":
-        support_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Contact Support", url="https://t.me/ll_its_rudransh_ll")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
-        ])
-        await callback.message.edit_text(
-            "🛠️ **Customer Support**\n\n For any issues, contact Owner by clicking the button below:",
-            reply_markup=support_keyboard
-        )
+        support_keyboard = [[Button.url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll")],
+                            [Button.inline("🔙 Back", b"back_main")]]
+        await event.edit("🛠️ **Customer Support**\n\n For any issues, contact Owner by clicking the button below:", buttons=support_keyboard)
 
     elif data == "back_main":
         await cleanup_user_login(user_id)
         state["state"] = None
-        await callback.message.edit_text(
-            "Select an option from below:",
-            reply_markup=main_keyboard()
-        )
+        await event.edit("Select an option from below:", buttons=main_keyboard())
 
     elif data == "add_acc":
         if not is_owner:
-            await callback.answer("❌ Only the Owner can add accounts!", show_alert=True)
+            await event.answer("❌ Only the Owner can add accounts!", alert=True)
             return
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔥 Spam Account", callback_data="add_type_spam"),
-                InlineKeyboardButton("🌱 Fresh Account", callback_data="add_type_fresh")
-            ],
-            [
-                InlineKeyboardButton("🆕 Registered Account", callback_data="add_type_registered")
-            ]
-        ])
-        await callback.message.reply_text("🌍 **[Owner]** Select Account Type:", reply_markup=keyboard)
+        keyboard = [
+            [Button.inline("🔥 Spam Account", b"add_type_spam"),
+             Button.inline("🌱 Fresh Account", b"add_type_fresh")],
+            [Button.inline("🆕 Registered Account", b"add_type_registered")]
+        ]
+        await event.respond("🌍 **[Owner]** Select Account Type:", buttons=keyboard)
 
     elif data in ["add_type_spam", "add_type_fresh", "add_type_registered"]:
         if not is_owner:
             return
-        if "spam" in data:
-            acc_type = "spam"
-        elif "registered" in data:
-            acc_type = "registered"
-        else:
-            acc_type = "fresh"
-
+        if "spam" in data: acc_type = "spam"
+        elif "registered" in data: acc_type = "registered"
+        else: acc_type = "fresh"
         state["temp_acc_type"] = acc_type
         state["state"] = "awaiting_country_name"
-        await callback.message.edit_text(f"🌍 **[Owner - {acc_type.upper()}]** Enter Country Name (e.g. India, USA):")
+        await event.edit(f"🌍 **[Owner - {acc_type.upper()}]** Enter Country Name (e.g. India, USA):")
 
     elif data == "buy_acc":
         await cleanup_user_login(user_id)
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔥 Spam Accounts", callback_data="buy_type_spam"),
-                InlineKeyboardButton("🌱 Fresh Accounts", callback_data="buy_type_fresh")
-            ],
-            [
-                InlineKeyboardButton("🆕 New Registered", callback_data="buy_type_registered")
-            ]
-        ])
-        await callback.message.edit_text("🛒 **Select Account Category:**", reply_markup=keyboard)
+        keyboard = [
+            [Button.inline("🔥 Spam Accounts", b"buy_type_spam"),
+             Button.inline("🌱 Fresh Accounts", b"buy_type_fresh")],
+            [Button.inline("🆕 New Registered", b"buy_type_registered")]
+        ]
+        await event.edit("🛒 **Select Account Category:**", buttons=keyboard)
 
     elif data in ["buy_type_spam", "buy_type_fresh", "buy_type_registered"]:
         await cleanup_user_login(user_id)
-        if "spam" in data:
-            selected_type = "spam"
-        elif "registered" in data:
-            selected_type = "registered"
-        else:
-            selected_type = "fresh"
-
+        if "spam" in data: selected_type = "spam"
+        elif "registered" in data: selected_type = "registered"
+        else: selected_type = "fresh"
         countries = get_available_countries(selected_type)
         if not countries:
-            await callback.answer(f"❌ No {selected_type.upper()} accounts in stock right now!", show_alert=True)
+            await event.answer(f"❌ No {selected_type.upper()} accounts in stock right now!", alert=True)
             return
-
         btn_list = []
         for c in countries:
             c_name, c_count, c_code = c["_id"], c["count"], c["code"]
             flag = get_flag_emoji(c_name)
-            
-            btn_list.append([
-                InlineKeyboardButton(
-                    f"{flag} {c_name} ({c_code}) | Stock: {c_count}", 
-                    callback_data=f"select_country_{selected_type}_{c_name}"
-                )
-            ])
-        
-        btn_list.append([InlineKeyboardButton("🔙 Back to Category", callback_data="buy_acc")])
-        await callback.message.edit_text(f"🛒 **Select Country ({selected_type.upper()}):**", reply_markup=InlineKeyboardMarkup(btn_list))
-        
+            btn_list.append([Button.inline(
+                f"{flag} {c_name} ({c_code}) | Stock: {c_count}",
+                f"select_country_{selected_type}_{c_name}".encode()
+            )])
+        btn_list.append([Button.inline("🔙 Back to Category", b"buy_acc")])
+        await event.edit(f"🛒 **Select Country ({selected_type.upper()}):**", buttons=btn_list)
+
     elif data.startswith("select_country_"):
-        await cleanup_user_login(user_id)  # Yeh line bhi yahan add kar dein
+        await cleanup_user_login(user_id)
         parts = data.split("_")
         selected_type = parts[2]
         selected_country = "_".join(parts[3:])
-
         type_filter = [
             {"type": selected_type},
             {"type": {"$exists": False}} if selected_type == "fresh" else {"_id": None}
         ]
-
         available_accs = list(accounts_col.find({
-            "country_name": selected_country, 
-            "sold": False,
-            "$or": type_filter
+            "country_name": selected_country, "sold": False, "$or": type_filter
         }))
-
         if not available_accs:
-            await callback.answer("❌ No accounts left in this category!", show_alert=True)
+            await event.answer("❌ No accounts left in this category!", alert=True)
             return
-
         btn_list = []
         for acc in available_accs:
-            phone = acc["phone"]
-            price = acc["price"]
+            phone = acc["phone"]; price = acc["price"]
             masked_num = mask_phone_number(phone, acc.get('country_code'))
-            btn_list.append([InlineKeyboardButton(f"📱 {masked_num} - ₹{price}", callback_data=f"buy_acc_{phone}")])
-        
-        btn_list.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="buy_acc")])
-        await callback.message.edit_text(f"🛒 **Available {selected_type.upper()} Accounts for {selected_country}:**", reply_markup=InlineKeyboardMarkup(btn_list))
+            btn_list.append([Button.inline(f"📱 {masked_num} - ₹{price}", f"buy_acc_{phone}".encode())])
+        btn_list.append([Button.inline("🔙 Back to Categories", b"buy_acc")])
+        await event.edit(f"🛒 **Available {selected_type.upper()} Accounts for {selected_country}:**", buttons=btn_list)
 
     elif data == "deposit":
         state["state"] = "awaiting_deposit_amount"
-        await callback.message.reply_text("💵 Enter the amount you want to deposit (e.g., 100):")
+        await event.respond("💵 Enter the amount you want to deposit (e.g., 100):")
 
     elif data == "deposit_cancel":
         state["state"] = None
         state["deposit_amount"] = 0.0
         try:
-            await callback.message.delete()
+            await event.delete()
         except Exception:
             pass
-        await callback.answer("❌ Deposit cancelled successfully.", show_alert=True)
+        await event.answer("❌ Deposit cancelled successfully.", alert=True)
         return
 
     elif data == "deposit_yes_paid":
         amount = state.get("deposit_amount", 0.0)
-        state["state"] = "awaiting_deposit_ss" # Ab user SS bhej sakta hai
-        
-        # Scanner message delete karke naya message bhejna jiske sath Cancel button ho
+        state["state"] = "awaiting_deposit_ss"
         try:
-            await callback.message.delete()
+            await event.delete()
         except Exception:
             pass
-
         instruction_text = (
             f"📸 **Send Payment Screenshot (SS)**\n\n"
             f"💰 **Amount:** ₹{amount}\n"
             f"📌 **UPI ID:** `{UPI_ID}`\n\n"
             f"Kripya apne payment ka successful screenshot yahin chat me send karein."
         )
-
-        cancel_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="deposit_cancel")]
-        ])
-
-        await callback.message.reply_text(
-            text=instruction_text,
-            reply_markup=cancel_keyboard
-        )
-        await callback.answer()
+        cancel_keyboard = [[Button.inline("❌ Cancel", b"deposit_cancel")]]
+        await event.respond(instruction_text, buttons=cancel_keyboard)
+        await event.answer()
         return
 
     elif data.startswith("do_auto_verify_"):
         parts = data.split("_")
         amount = float(parts[3])
         state = get_state(user_id)
-
         photo_file_id = state.get("pending_photo_id")
-        qr_gen_time = state.get("qr_generated_at") # QR generate hone ka time
-
+        qr_gen_time = state.get("qr_generated_at")
         if not photo_file_id:
-            await callback.answer("❌ Session expired ya photo nahi mili! Kripya dobara deposit try karein.", show_alert=True)
+            await event.answer("❌ Session expired ya photo nahi mili! Kripya dobara deposit try karein.", alert=True)
             return
-
-        msg_wait = await callback.message.edit_text("🔍 Bot screenshot verify kar raha hai, kripya intezaar karein...")
-
-        # Photo download karke AI se details extract karna
-        photo_bytes_io = await client.download_media(photo_file_id, in_memory=True)
-        photo_bytes = photo_bytes_io.getvalue()
-
+        msg_wait = await event.edit("🔍 Bot screenshot verify kar raha hai, kripya intezaar karein...")
+        # Download media
+        photo_bytes = await bot.download_media(photo_file_id, file=bytes)
         details = await extract_ss_details(photo_bytes)
-
         upi_txn_id = details.get("upi_txn_id")
         customer_upi = details.get("customer_upi") or "N/A"
-        ss_date = details.get("date")
-        ss_time = details.get("time")
-        ss_amount = details.get("amount")
-        ss_receiver = details.get("receiver")
+        ss_date = details.get("date"); ss_time = details.get("time")
+        ss_amount = details.get("amount"); ss_receiver = details.get("receiver")
         is_valid = details.get("is_valid_ss")
 
-        # 1. Validity Check
         if not is_valid or not upi_txn_id or not ss_date or not ss_time:
             state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit_text(
+            await msg_wait.edit(
                 "❌ **Galt ya Adhoora Screenshot!**\n\n"
                 "Transaction ID, Date ya Time saaf nahi dikh raha hai.\n\n"
                 "👉 **Kripya apna real aur saaf payment screenshot yahin dobara send karein:**"
             )
             return
 
-        # 2. Amount Match Check
         if ss_amount is not None and float(ss_amount) != float(amount):
             state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit_text(
+            await msg_wait.edit(
                 f"❌ **Amount Mismatch!** Aapne ₹{amount} ki request dali thi par SS me ₹{ss_amount} hai.\n\n"
                 "👉 **Kripya sahi amount ka real screenshot dobara send karein:**"
             )
             return
 
-        # 3. Time Validation Check (Scanner generate hone ke baad ka hona chahiye)
-        # 3. Time Validation Check (Scanner generate hone ke baad ka hona chahiye)
         if qr_gen_time and ss_date and ss_time:
             ss_dt = parse_ss_datetime(ss_date, ss_time)
-            
-            # Agar AI ne time sahi se parse nahi kiya ya time QR generate hone se pehle ka hai
             if not ss_dt or ss_dt < qr_gen_time:
                 state["state"] = "awaiting_deposit_ss"
-                await msg_wait.edit_text(
+                await msg_wait.edit(
                     "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai ya time match nahi hua (Purana SS).\n\n"
                     "👉 **Kripya naya payment karke uska fresh screenshot bhejien:**"
                 )
                 return
         else:
-            # Agar screenshot me date/time hi nahi mila, toh safety ke liye auto-approve mat karo
             state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit_text(
+            await msg_wait.edit(
                 "❌ **Time Verification Failed!** Screenshot se payment ka time read nahi ho paya.\n\n"
                 "👉 **Kripya saaf screenshot dobara send karein:**"
             )
             return
 
-        # 4. Receiver UPI ID Match Check (Strict Check)
         if ss_receiver and UPI_ID:
             clean_ss_recv = re.sub(r'[\s@._-]', '', str(ss_receiver)).lower()
             clean_bot_upi = re.sub(r'[\s@._-]', '', str(UPI_ID)).lower()
-            
-            # Agar bot ka UPI ya UPI ka pehla hissa (handle) match nahi hota hai
             bot_handle = clean_bot_upi.split()[0] if clean_bot_upi else ""
             if clean_bot_upi not in clean_ss_recv and clean_ss_recv not in clean_bot_upi and bot_handle not in clean_ss_recv:
                 state["state"] = "awaiting_deposit_ss"
-                await msg_wait.edit_text(
+                await msg_wait.edit(
                     f"❌ **Wrong Receiver UPI!** Yeh payment kisi aur ke UPI (`{ss_receiver}`) par bheja gaya hai, hamare UPI par nahi.\n\n"
                     "👉 **Kripya sahi UPI par payment karke uska naya screenshot send karein:**"
                 )
                 return
 
-        # 5. Duplicate Transaction Check
-        existing_txn = db["deposits"].find_one({
-            "upi_txn_id": upi_txn_id if upi_txn_id else "NONE"
-        })
+        existing_txn = db["deposits"].find_one({"upi_txn_id": upi_txn_id if upi_txn_id else "NONE"})
         if existing_txn:
             state["state"] = "awaiting_deposit_ss"
-            await msg_wait.edit_text(
+            await msg_wait.edit(
                 "❌ **Duplicate Transaction ID!** Yeh UTR pehle hi use ho chuki hai.\n\n"
                 "👉 **Kripya naya screenshot dobara send karein:**"
             )
             return
 
-        # Sabhi checks pass hone ke baad database me save karke balance add kar do
         db["deposits"].insert_one({
-            "user_id": user_id,
-            "upi_txn_id": upi_txn_id,
-            "customer_upi": customer_upi,
-            "amount": amount,
-            "date": ss_date,
-            "time": ss_time,
-            "status": "approved",
-            "approved_by": "Automatic Bot Click"
+            "user_id": user_id, "upi_txn_id": upi_txn_id, "customer_upi": customer_upi,
+            "amount": amount, "date": ss_date, "time": ss_time,
+            "status": "approved", "approved_by": "Automatic Bot Click"
         })
-
-        users_col.update_one(
-            {"user_id": user_id},
-            {"$inc": {"wallet": amount, "total_deposited": amount}}
-        )
-
-        # Referral Commission (2%)
+        users_col.update_one({"user_id": user_id}, {"$inc": {"wallet": amount, "total_deposited": amount}})
         target_user = users_col.find_one({"user_id": user_id})
         referrer_id = target_user.get("referred_by") if target_user else None
         if referrer_id:
             commission = (amount * 2) / 100
-            users_col.update_one({"user_id": int(referrer_id)}, {"$inc": {"wallet": commission, "referral_profit": commission}})
+            users_col.update_one({"user_id": int(referrer_id)},
+                                 {"$inc": {"wallet": commission, "referral_profit": commission}})
             try:
-                await bot.send_message(referrer_id, f"🎉 Referral commission received! Referred user deposited ₹{amount}, you got ₹{commission:.2f} bonus.")
+                await bot.send_message(referrer_id,
+                    f"🎉 Referral commission received! Referred user deposited ₹{amount}, you got ₹{commission:.2f} bonus.")
             except Exception:
                 pass
 
-        # Customer ko success message
         success_text = (
             f"🎉 **Deposit Auto-Approved Successfully!**\n\n"
             f"💰 **Amount Added:** ₹{amount}\n"
             f"🔢 **Txn ID:** `{upi_txn_id or 'N/A'}`\n"
             f"✨ Aapka payment successfully verify karke wallet me add kar diya gaya hai!"
         )
-        await msg_wait.edit_text(success_text)
-        
+        await msg_wait.edit(success_text)
         masked_sender_upi = mask_upi_id(customer_upi)
-        # Log groups par message bhejna
-        # Log groups par message bhejna
-        from datetime import timezone
-
         now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         auto_date_str = now.strftime("%d-%m-%Y")
         auto_time_str = now.strftime("%I:%M:%S %p")
         approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
-        
         group_msg = (
             f"🎉 **Payment Approved Successful (Auto)!**\n\n"
-            f"👤 **User:** {callback.from_user.mention}\n"
+            f"👤 **User:** {sender.mention}\n"
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Amount Added:** ₹{amount}\n"
-            f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"      # <--- Alag line UPI ke liye
+            f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"
             f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
             f"🤖 **Approved By:** {approved_info}\n\n"
             f"🤖 **Bot :** @DarktgOtp_bot\n"
@@ -1639,258 +1348,184 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             await bot.send_message(PAYMENT_LOG_GROUP, group_msg)
         except Exception as e:
             print(f"Payment group log err: {e}")
-
         try:
             await bot.send_message(OTP_GROUP_ID, group_msg)
         except Exception as e:
             print(f"OTP group log err: {e}")
-            
 
     elif data.startswith("do_manual_verify_"):
         parts = data.split("_")
         amount = float(parts[3])
         state = get_state(user_id)
         photo_file_id = state.get("pending_photo_id")
-
         if not photo_file_id:
-            await callback.answer("❌ Session expired! Kripya dobara try karein.", show_alert=True)
+            await event.answer("❌ Session expired! Kripya dobara try karein.", alert=True)
             return
-
-        msg_wait = await callback.message.edit_text("⏳ Processing manual verification request... It takes 1 to 2 mints")
-
-        # Photo download karke AI se details extract karna taaki UTR, Date, Time mil sake
-        photo_bytes_io = await client.download_media(photo_file_id, in_memory=True)
-        photo_bytes = photo_bytes_io.getvalue()
-
+        msg_wait = await event.edit("⏳ Processing manual verification request... It takes 1 to 2 mints")
+        photo_bytes = await bot.download_media(photo_file_id, file=bytes)
         details = await extract_ss_details(photo_bytes)
         upi_txn_id = details.get("upi_txn_id") or "N/A"
         customer_upi = details.get("customer_upi")
         ss_date = details.get("date") or "N/A"
         ss_time = details.get("time") or "N/A"
-
-        # Pending status ke sath database me save karna taaki baad me approve/reject me UTR mil sake
         db["deposits"].update_one(
             {"user_id": user_id, "amount": amount, "status": "pending"},
-            {
-                "$set": {
-                    "user_id": user_id,
-                    "upi_txn_id": upi_txn_id if upi_txn_id != "N/A" else None,
-                    "customer_upi": customer_upi if customer_upi else None,
-                    "amount": amount,
-                    "date": ss_date,
-                    "time": ss_time,
-                    "status": "pending"
-                }
-            },
+            {"$set": {
+                "user_id": user_id,
+                "upi_txn_id": upi_txn_id if upi_txn_id != "N/A" else None,
+                "customer_upi": customer_upi if customer_upi else None,
+                "amount": amount, "date": ss_date, "time": ss_time, "status": "pending"
+            }},
             upsert=True
         )
-
-        # 🛠️ Yahan try-except lagane se error nahi aayega agar text same raha toh
         try:
-            await msg_wait.edit_text(
+            await msg_wait.edit(
                 "⏳ **Manual Request Submitted!**\n\n"
                 "Aapka screenshot saari details ke sath admin ke paas bhej diya gaya hai. Kripya thoda intezaar karein."
             )
         except Exception:
             pass
-
-        # Admin group me poori details (UTR, Date, Time) aur Approve/Reject buttons ke sath bhej na
-        username = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
+        username = f"@{sender.username}" if sender.username else "N/A"
         admin_caption = (
             f"💵 **New Manual Deposit Request**\n\n"
-            f"👤 **User:** {callback.from_user.mention}\n"
+            f"👤 **User:** {sender.mention}\n"
             f"📛 **Username:** {username}\n"
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Amount:** ₹{amount}\n"
             f"🔢 **UPI Txn ID:** `{upi_txn_id}`\n"
-            f"💳 **Customer UPI:** `{customer_upi or 'N/A'}`\n" # <--- Yahan google_txn_id ki jagah customer_upi kar diya gaya hai
+            f"💳 **Customer UPI:** `{customer_upi or 'N/A'}`\n"
             f"📅 **Txn Date:** `{ss_date}`\n"
             f"⏰ **Txn Time:** `{ss_time}`"
         )
-
         try:
-            await bot.send_photo(
-                chat_id=PAYMENT_LOG_GROUP,
-                photo=photo_file_id,
-                caption=admin_caption,
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve_dep_{user_id}_{amount}"),
-                        InlineKeyboardButton("❌ Reject", callback_data=f"reject_dep_{user_id}_{amount}")
-                    ]
-                ])
+            await bot.send_file(
+                chat_id=PAYMENT_LOG_GROUP, file=photo_file_id, caption=admin_caption,
+                buttons=[[
+                    Button.inline("✅ Approve", f"approve_dep_{user_id}_{amount}".encode()),
+                    Button.inline("❌ Reject", f"reject_dep_{user_id}_{amount}".encode())
+                ]]
             )
         except Exception as e:
             print(f"Admin group send err: {e}")
-            
 
     elif data.startswith("buy_acc_"):
         target_phone = data.replace("buy_acc_", "")
-
-        # 🔒 RACE CONDITION CHECK: Same phone already kisi aur ne select kiya?
-        already_busy = any(
-            s.get("account", {}).get("phone") == target_phone
-            for s in login_states.values()
-        )
+        already_busy = any(s.get("account", {}).get("phone") == target_phone for s in login_states.values())
         if already_busy or target_phone in _busy_phones:
-            await callback.answer("⚠️ Yeh account abhi kisi aur user ne select kiya hai. Kuch der baad try karein.", show_alert=True)
+            await event.answer("⚠️ Yeh account abhi kisi aur user ne select kiya hai. Kuch der baad try karein.", alert=True)
             return
-        
         await cleanup_user_login(user_id)
-
         acc = accounts_col.find_one({"phone": target_phone, "sold": False})
-
         if not acc:
-            await callback.answer("❌ Account no longer available!", show_alert=True)
+            await event.answer("❌ Account no longer available!", alert=True)
             return
-
         if not is_owner and float(user.get("wallet", 0)) < float(acc["price"]):
-            await callback.answer("❌ Insufficient Wallet Balance! Please Deposit money first.", show_alert=True)
+            await event.answer("❌ Insufficient Wallet Balance! Please Deposit money first.", alert=True)
             return
-
-        # 🔒 Mark as busy immediately (atomic-ish)
         _busy_phones.add(target_phone)
         session_name = f"sessions/{target_phone.replace('+', '').replace(' ', '')}"
         lock = _lock_for(session_name)
-
-        # Agar session file pe koi aur kaam kar raha hai, wait karo
         if lock.locked():
             _busy_phones.discard(target_phone)
-            await callback.answer("⏳ Session busy hai, thodi der me try karein.", show_alert=True)
+            await event.answer("⏳ Session busy hai, thodi der me try karein.", alert=True)
             return
-
         async with lock:
-            user_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
+            user_client = TelegramClient(session_name, API_ID, API_HASH)
             try:
-                if user_client.is_connected:
+                if user_client.is_connected():
                     await user_client.disconnect()
                 await user_client.connect()
             except Exception as e:
                 _busy_phones.discard(target_phone)
-                await callback.answer(f"❌ Session connection error: {e}", show_alert=True)
+                await event.answer(f"❌ Session connection error: {e}", alert=True)
                 return
-
         login_states[user_id] = {
-            "account": acc,
-            "client": user_client,
-            "purchase_time": datetime.now().timestamp(),
-            "is_logged_in": False
+            "account": acc, "client": user_client,
+            "purchase_time": datetime.now().timestamp(), "is_logged_in": False
         }
-
         owner_tag = " [👑 OWNER FREE ACCESS]" if is_owner else ""
-
-        await callback.message.edit_text(
+        await event.edit(
             f"✅ **Account Selected!**{owner_tag}\n\n"
             f"📞 **Phone Number:** `{acc['phone']}`\n\n"
             f"👉 Login now in your Telegram app using this phone number.\n"
             f"When code arrives, press the button below to fetch OTP.\n"
             f"⏳ *Note: Aapke paas login karne ke liye 5 minute ka time hai.*",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📩 Request OTP / 2FA Code", callback_data="fetch_otp")],
-                [InlineKeyboardButton("🔙 Back to Countries", callback_data="buy_acc")]
-            ])
+            buttons=[
+                [Button.inline("📩 Request OTP / 2FA Code", b"fetch_otp")],
+                [Button.inline("🔙 Back to Countries", b"buy_acc")]
+            ]
         )
 
     elif data == "fetch_otp":
         if user_id not in login_states:
-            await callback.answer("❌ Active session nahi mila. Kripya firse account select karein.", show_alert=True)
+            await event.answer("❌ Active session nahi mila. Kripya firse account select karein.", alert=True)
             return
-
         session_data = login_states[user_id]
         purchase_time = session_data.get("purchase_time", 0)
-        
-        # 1. 5 Minutes (300 seconds) Expiry Logic
-        # 1. 5 Minutes (300 seconds) Expiry Logic
         if datetime.now().timestamp() - purchase_time > 300:
             await cleanup_user_login(user_id)
-            await callback.answer("⏰ Time limit expired (5 mins)! Number stock me wapas chala gaya.", show_alert=True)
-            await callback.message.edit_text("⏰ **Session Expired!** Aapne 5 minute ke andar login nahi kiya, isliye account stock me wapas bhej diya gaya hai.")
+            await event.answer("⏰ Time limit expired (5 mins)! Number stock me wapas chala gaya.", alert=True)
+            await event.edit("⏰ **Session Expired!** Aapne 5 minute ke andar login nahi kiya, isliye account stock me wapas bhej diya gaya hai.")
             return
-
         acc = session_data["account"]
-        user_client: Client = session_data["client"]
-
-        # Ensure active connection
+        user_client: TelegramClient = session_data["client"]
         try:
-            if not user_client.is_connected:
+            if not user_client.is_connected():
                 await user_client.connect()
         except Exception as conn_err:
-            await callback.answer(f"❌ Session re-connection failed: {conn_err}", show_alert=True)
+            await event.answer(f"❌ Session re-connection failed: {conn_err}", alert=True)
             return
-
         try:
-            # 2. Fetch latest messages from official Telegram Service Notifications (777000)
             otp_found = False
-            async for msg in user_client.get_chat_history(777000, limit=5):
+            async for msg in user_client.iter_messages(777000, limit=5):
                 if not msg.text:
                     continue
-                    
                 msg_ts = msg.date.timestamp() if msg.date else 0
-
                 if msg_ts < purchase_time:
                     continue
-
                 otp_code = extract_otp(msg.text)
-
                 if otp_code != "NOT-FOUND":
                     otp_found = True
-                    # 3. Mark as SOLD and deduct balance ONLY when OTP is delivered
                     if not session_data.get("is_logged_in", False):
                         if not is_owner:
                             new_wallet = float(user.get("wallet", 0)) - float(acc["price"])
                             users_col.update_one(
-                                {"user_id": int(user_id)}, 
-                                {
-                                    "$set": {"wallet": new_wallet},
-                                    "$inc": {"total_spent": float(acc["price"])}
-                                }
+                                {"user_id": int(user_id)},
+                                {"$set": {"wallet": new_wallet}, "$inc": {"total_spent": float(acc["price"])}}
                             )
-
-                        accounts_col.update_one({"phone": acc["phone"]}, {"$set": {"sold": True, "buyer_id": int(user_id)}})
+                        accounts_col.update_one({"phone": acc["phone"]},
+                                                {"$set": {"sold": True, "buyer_id": int(user_id)}})
                         session_data["is_logged_in"] = True
-
                     two_fa = acc.get("2fa_password") or "None"
                     masked_num = mask_phone_number(acc["phone"], acc.get('country_code'))
-
-                    await callback.message.reply_text(
+                    await event.respond(
                         f"📩 **Login Verification Code:**\n\n"
                         f"📱 **Phone:** `{masked_num}`\n"
                         f"🔑 **OTP:** `{otp_code}`\n"
                         f"🔐 **2FA Password:** `{two_fa}`",
-                        reply_markup=logout_keyboard()
+                        buttons=logout_keyboard()
                     )
-                    break  # Stop checking further messages once found
-
+                    break
             if not otp_found:
-                await callback.answer("❌ Naya OTP nahi mila! Kripya Telegram app me 'Send Code' par click karein.", show_alert=True)
-
+                await event.answer("❌ Naya OTP nahi mila! Kripya Telegram app me 'Send Code' par click karein.", alert=True)
         except Exception as e:
             print(f"OTP Fetch Error: {e}")
-            await callback.answer("Error fetching OTP. Make sure you pressed 'Send Code' on Telegram app.", show_alert=True)
-            
+            await event.answer("Error fetching OTP. Make sure you pressed 'Send Code' on Telegram app.", alert=True)
+
     elif data == "customer_logout":
         if user_id in login_states:
             session_data = login_states[user_id]
-            
             if not session_data.get("is_logged_in", False):
-                await callback.answer("❌ Aapne abhi tak new login verify nahi kiya hai!", show_alert=True)
+                await event.answer("❌ Aapne abhi tak new login verify nahi kiya hai!", alert=True)
                 return
-
             acc = session_data["account"]
             user_client = session_data["client"]
             masked_num = mask_phone_number(acc['phone'], acc.get('country_code'))
-            
-            # User ki details aur mention fetch karna
-            user_mention = callback.from_user.mention
-            username_str = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
-
-            # Account ka price fetch karna
+            user_mention = sender.mention
+            username_str = f"@{sender.username}" if sender.username else "N/A"
             acc_price = acc.get("price", 0.0)
-
-            # User ka referral link generate karna
-            bot_info = await client.get_me()
-            ref_link = f"https://t.me/{bot_info.username}?start=REF{user_id}4F886"
-
+            me = await bot.get_me()
+            ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
             group_msg = (
                 f"🎉 **New Purchase Successful**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -1901,105 +1536,65 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"✨ **Thanks for purchase!**\n"
                 f"🔗 **Referral Link:** `{ref_link}`"
             )
-
             try:
-                await bot.send_message(OTP_GROUP_ID, group_msg, disable_web_page_preview=True)
+                await bot.send_message(OTP_GROUP_ID, group_msg, link_preview=False)
             except Exception as ge:
                 print(f"Failed to send to OTP Group: {ge}")
-
-            # Saare owners ke paas notification bhejne ke liye loop
             for owner_id in OWNER_IDS:
                 try:
-                    await bot.send_message(
-                        owner_id,
+                    await bot.send_message(owner_id,
                         f"🔔 **Session Ended / Logout Alert**\n\n"
                         f"👤 **User:** {user_mention}\n"
                         f"📛 **Username:** {username_str}\n"
                         f"🆔 **Customer ID:** `{user_id}`\n"
                         f"📱 **Phone:** `{acc['phone']}`\n"
-                        f"Customer clicked logout from bot."
-                    )
+                        f"Customer clicked logout from bot.")
                 except Exception as oe:
                     print(f"Failed to send alert to owner {owner_id}: {oe}")
-
             try:
-                if user_client.is_connected:
+                if user_client.is_connected():
                     await user_client.log_out()
             except Exception:
                 pass
-
             del login_states[user_id]
-            await callback.message.edit_text("✅ You have logged out successfully from the session.")
+            await event.edit("✅ You have logged out successfully from the session.")
         else:
-            await callback.answer("No active session to logout.", show_alert=True)
+            await event.answer("No active session to logout.", alert=True)
 
     elif data.startswith("approve_dep_") or data.startswith("reject_dep_"):
         parts = data.split("_")
         action = parts[0]
-        target_user_id = int(parts[2])
-        amount = float(parts[3])
-
-        # User aur deposit details database se nikalna taaki UTR mil sake
+        target_user_id = int(parts[2]); amount = float(parts[3])
         target_user = users_col.find_one({"user_id": target_user_id})
         deposit_record = db["deposits"].find_one({"user_id": target_user_id, "amount": amount, "status": "pending"})
-        
-        # UTR / Transaction ID fetch karna (UPI ya Google Txn ID me se jo bhi ho)
         txn_id = "N/A"
         if deposit_record:
             txn_id = deposit_record.get("upi_txn_id") or deposit_record.get("google_txn_id") or "N/A"
-
-        # User ka telegram mention ya name banane ke liye
         try:
-            target_user_obj = await client.get_users(target_user_id)
-            user_mention = target_user_obj.mention
-            username_str = f"@{target_user_obj.username}" if target_user_obj.username else "N/A"
+            tu = await bot.get_entity(target_user_id)
+            user_mention = tu.mention
+            username_str = f"@{tu.username}" if tu.username else "N/A"
         except Exception:
             user_mention = f"User (`{target_user_id}`)"
             username_str = "N/A"
-
         if action == "approve":
-            # Status update deposit record me
             db["deposits"].update_one(
                 {"user_id": target_user_id, "amount": amount, "status": "pending"},
-                {"$set": {"status": "approved"}}
-            )
-
-            users_col.update_one(
-                {"user_id": target_user_id},
-                {
-                    "$inc": {
-                        "wallet": amount,
-                        "total_deposited": amount
-                    }
-                }
-            )
-    
+                {"$set": {"status": "approved"}})
+            users_col.update_one({"user_id": target_user_id},
+                                 {"$inc": {"wallet": amount, "total_deposited": amount}})
             referrer_id = target_user.get("referred_by") if target_user else None
-    
             if referrer_id:
                 commission = (amount * 2) / 100
-        
-                users_col.update_one(
-                    {"user_id": int(referrer_id)},
-                    {
-                        "$inc": {
-                            "wallet": commission,
-                            "referral_profit": commission
-                        }
-                    }
-                )
-        
+                users_col.update_one({"user_id": int(referrer_id)},
+                                     {"$inc": {"wallet": commission, "referral_profit": commission}})
                 try:
-                    await bot.send_message(
-                        referrer_id,
+                    await bot.send_message(referrer_id,
                         f"🎉 **Referral Commission Received!**\n\n"
                         f"Your referred user ({user_mention}) has deposited ₹{amount}.\n"
-                        f"💰 **You have received a 2% (₹{commission:.2f}) bonus in your wallet!**"
-                    )
+                        f"💰 **You have received a 2% (₹{commission:.2f}) bonus in your wallet!**")
                 except Exception:
                     pass
-
-            # Admin Group message update with full details
             log_group_msg = (
                 f"✅ **Deposit Approved Successfully**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -2007,63 +1602,47 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Approved Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Approved By:** {callback.from_user.mention}"
+                f"👑 **Approved By:** {sender.mention}"
             )
-            await callback.message.edit_text(log_group_msg)
-
-            # User ke paas jane wala notification message
+            await event.edit(log_group_msg)
             user_msg = (
                 f"🎉 **Your Deposit Has Been Approved!**\n\n"
                 f"💰 **Amount Added:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
                 f"✨ Your deposit has been approved and the amount has been added to your wallet!"
             )
-                        
             try:
                 await bot.send_message(target_user_id, user_msg)
             except Exception:
                 pass
-
             masked_sender_upi = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
-
-            from datetime import timezone
-
             now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             approval_date_str = now.strftime("%d-%m-%Y")
             approval_time_str = now.strftime("%I:%M:%S %p")
-            approved_by_info = f"{callback.from_user.mention} at {approval_date_str} {approval_time_str}"
-            # -----------------------------
+            approved_by_info = f"{sender.mention} at {approval_date_str} {approval_time_str}"
             group_approve_msg = (
                 f"🎉 **Payment Approved Successful!**\n\n"
                 f"👤 **User:** {user_mention}\n"
                 f"📛 **Username:** {username_str}\n"
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Amount Added:** ₹{amount}\n"
-                f"🔢 **UPI Txn ID:** `{txn_id}`\n"                   # <--- Ya agar aap yahan bhi `upi_txn_id` use karna chahein
+                f"🔢 **UPI Txn ID:** `{txn_id}`\n"
                 f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
                 f"👑 **Approved By:** {approved_by_info}\n\n"
                 f"🤖 **Bot :** @DarktgOtp_bot\n"
             )
-            
-            # 1. Payment Verification Group par bhejna
             try:
                 await bot.send_message(PAYMENT_LOG_GROUP, group_approve_msg)
             except Exception as e:
                 print(f"Failed to send approval to payment group: {e}")
-
-            # 2. Purchase Successful / OTP Group par bhi bhejna
             try:
                 await bot.send_message(OTP_GROUP_ID, group_approve_msg)
             except Exception as e:
                 print(f"Failed to send approval to OTP group: {e}")
-
         else:
-            # Status update deposit record me (Rejected)
             db["deposits"].update_one(
                 {"user_id": target_user_id, "amount": amount, "status": "pending"},
-                {"$set": {"status": "rejected"}}
-            )
-
+                {"$set": {"status": "rejected"}})
             masked_sender_upi = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
             log_group_msg = (
                 f"❌ **Deposit Rejected**\n\n"
@@ -2073,15 +1652,12 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"💰 **Rejected Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
                 f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
-                f"👑 **Rejected By:** {callback.from_user.mention}"
+                f"👑 **Rejected By:** {sender.mention}"
             )
-            await callback.message.edit_text(log_group_msg)
-
-            # User ka state wapas active karna taaki wo real SS dobara bhej sake
+            await event.edit(log_group_msg)
             target_user_state = get_state(target_user_id)
             target_user_state["state"] = "awaiting_deposit_ss"
             target_user_state["deposit_amount"] = amount
-
             user_msg = (
                 f"❌ **Deposit Request Rejected**\n\n"
                 f"💰 **Amount:** ₹{amount}\n"
@@ -2093,7 +1669,6 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 await bot.send_message(target_user_id, user_msg)
             except Exception:
                 pass
- 
             group_reject_msg = (
                 f"❌ **Payment Request Rejected!**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -2101,65 +1676,61 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Rejected By:** {callback.from_user.mention}"
+                f"👑 **Rejected By:** {sender.mention}"
             )
-            
-            # 1. Payment Verification Group par bhejna
             try:
                 await bot.send_message(PAYMENT_LOG_GROUP, group_reject_msg)
             except Exception as e:
                 print(f"Failed to send rejection to payment group: {e}")
-
-            # 2. Purchase Successful / OTP Group par bhi bhejna
             try:
                 await bot.send_message(OTP_GROUP_ID, group_reject_msg)
             except Exception as e:
                 print(f"Failed to send rejection to OTP group: {e}")
-                
-# ================= MESSAGE HANDLER =================
-@bot.on_message(filters.text & ~filters.command(["start", "add", "addbulk", "broadcast", "gcast"]))
-async def handle_text(client: Client, message: Message):
-    user_id = message.from_user.id
 
-    # 🔴 FORCE JOIN LIVE CHECK (Leave karne par bhi pakad lega)
-    if not await is_user_joined(client, user_id):
+
+# ================= MESSAGE HANDLER =================
+@bot.on(events.NewMessage())
+async def handle_text(event: events.NewMessage.Event):
+    if not event.is_private:
+        return
+    text = event.text
+    if not text or text.startswith("/"):
+        return
+
+    user_id = event.sender_id
+    if not await is_user_joined(bot, user_id):
         keyboard = await build_force_join_keyboard()
-        await message.reply_text(
+        await event.reply(
             "⚠️ **Aapne hamare required Channels/Groups ko leave kar diya hai!**\n\n"
             "Bot ko dobara use karne ke liye pehle sabhi channels/groups ko join karein:",
-            reply_markup=keyboard
+            buttons=keyboard
         )
         return
-    
-    text = message.text
+
     state = get_state(user_id)
     user = get_user(user_id)
-    is_owner = (int(user_id) in OWNER_IDS)
+    is_owner = (user_id in OWNER_IDS)
 
     if text == "💳 Deposit Money":
         state["state"] = "awaiting_deposit_amount"
-        await message.reply_text("💵 Enter the amount you want to deposit (e.g., 100):")
+        await event.reply("💵 Enter the amount you want to deposit (e.g., 100):")
         return
 
     elif text == "🛒 Buy Account":
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔥 Spam Accounts", callback_data="buy_type_spam"),
-                InlineKeyboardButton("🌱 Fresh Accounts", callback_data="buy_type_fresh")
-            ],
-            [
-                InlineKeyboardButton("🆕 New Registered", callback_data="buy_type_registered")
-            ]
-        ])
-        await message.reply_text("🛒 **Select Account Category:**", reply_markup=keyboard)
+        keyboard = [
+            [Button.inline("🔥 Spam Accounts", b"buy_type_spam"),
+             Button.inline("🌱 Fresh Accounts", b"buy_type_fresh")],
+            [Button.inline("🆕 New Registered", b"buy_type_registered")]
+        ]
+        await event.reply("🛒 **Select Account Category:**", buttons=keyboard)
         return
-    
-    elif text == "👤 Profile":
-        bot_info = await client.get_me()
-        ref_link = f"https://t.me/{bot_info.username}?start=REF{user_id}4F886"
-        username_str = f"@{message.from_user.username}" if message.from_user.username else "N/A"
-        user_mention = message.from_user.mention
 
+    elif text == "👤 Profile":
+        me = await bot.get_me()
+        ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
+        sender = await event.get_sender()
+        username_str = f"@{sender.username}" if sender.username else "N/A"
+        user_mention = sender.mention
         profile_text = (
             f"👤 **USER PROFILE**\n\n"
             f"👤 **Name:** {user_mention}\n"
@@ -2170,7 +1741,7 @@ async def handle_text(client: Client, message: Message):
             f"🔗 **Your Referral Link:**\n`{ref_link}`\n\n"
             f"🎁 *Har referral deposit ka 2% aapke wallet me auto-credit hoga!*"
         )
-        await message.reply_text(profile_text)
+        await event.reply(profile_text)
         return
 
     elif text == "📊 Stats":
@@ -2182,229 +1753,186 @@ async def handle_text(client: Client, message: Message):
             f"💵 **Total Amount Deposited:** ₹{user.get('total_deposited', 0.0):.2f}\n"
             f"🎁 **Referral Earnings (2%):** ₹{user.get('referral_profit', 0.0):.2f}"
         )
-        stats_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("👥 Referral Log", callback_data="ref_log"), InlineKeyboardButton("🛒 Purchase Log", callback_data="purchase_log")]
-        ])
-        await message.reply_text(stats_text, reply_markup=stats_buttons)
+        stats_buttons = [[Button.inline("👥 Referral Log", b"ref_log"),
+                          Button.inline("🛒 Purchase Log", b"purchase_log")]]
+        await event.reply(stats_text, buttons=stats_buttons)
         return
 
     elif text == "🛠️ Support":
-        support_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Contact Support", url="https://t.me/ll_its_rudransh_ll")]
-        ])
-        await message.reply_text(
-            "🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:",
-            reply_markup=support_keyboard
-        )
+        support_keyboard = [[Button.url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll")]]
+        await event.reply("🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:",
+                          buttons=support_keyboard)
         return
 
-    # User States
+    # BULK OTP
     if state and state.get("state") == "awaiting_bulk_otp":
         otp = text.strip().replace(" ", "")
         acc_client = state["temp_client"]
         curr = state["current_acc"]
         phone = curr["phone"]
-
         try:
-            if not acc_client.is_connected:
+            if not acc_client.is_connected():
                 await acc_client.connect()
-
-            await acc_client.sign_in(phone, state["temp_code_hash"], otp)
+            await acc_client.sign_in(phone, code=otp, phone_code_hash=state["temp_code_hash"])
             accounts_col.update_one(
                 {"phone": phone},
-                {"$set": {
-                    "phone": phone, "price": curr["price"],
-                    "country_name": curr["c_name"], "country_code": curr["c_code"],
-                    "type": curr.get("type", "fresh"),
-                    "sold": False, "2fa_password": curr["password"]
-                }},
-                upsert=True
-            )
+                {"$set": {"phone": phone, "price": curr["price"],
+                          "country_name": curr["c_name"], "country_code": curr["c_code"],
+                          "type": curr.get("type", "fresh"), "sold": False,
+                          "2fa_password": curr["password"]}},
+                upsert=True)
             await acc_client.disconnect()
-
-            await message.reply_text(f"✅ `{phone}` Logged in & Added Successfully!")
+            await event.reply(f"✅ `{phone}` Logged in & Added Successfully!")
             state["completed"] = state.get("completed", 0) + 1
             state["state"] = None
-            await process_next_bulk_account(client, user_id, message)
-
-        except SessionPasswordNeeded:
+            await process_next_bulk_account(bot, user_id, event)
+        except SessionPasswordNeededError:
             if curr["password"]:
                 try:
-                    await acc_client.check_password(curr["password"])
+                    await acc_client.sign_in(password=curr["password"])
                     accounts_col.update_one(
                         {"phone": phone},
-                        {"$set": {
-                            "phone": phone, "price": curr["price"],
-                            "country_name": curr["c_name"], "country_code": curr["c_code"],
-                            "type": curr.get("type", "fresh"),
-                            "sold": False, "2fa_password": curr["password"]
-                        }},
-                        upsert=True
-                    )
+                        {"$set": {"phone": phone, "price": curr["price"],
+                                  "country_name": curr["c_name"], "country_code": curr["c_code"],
+                                  "type": curr.get("type", "fresh"), "sold": False,
+                                  "2fa_password": curr["password"]}},
+                        upsert=True)
                     await acc_client.disconnect()
-                    await message.reply_text(f"✅ `{phone}` (with 2FA) Logged in & Saved!")
+                    await event.reply(f"✅ `{phone}` (with 2FA) Logged in & Saved!")
                     state["completed"] = state.get("completed", 0) + 1
                     state["state"] = None
-                    await process_next_bulk_account(client, user_id, message)
+                    await process_next_bulk_account(bot, user_id, event)
                 except Exception as p_err:
                     await acc_client.disconnect()
-                    await message.reply_text(f"❌ Incorrect 2FA Password for `{phone}`: {str(p_err)}")
+                    await event.reply(f"❌ Incorrect 2FA Password for `{phone}`: {str(p_err)}")
                     state["state"] = None
-                    await process_next_bulk_account(client, user_id, message)
+                    await process_next_bulk_account(bot, user_id, event)
             else:
                 await acc_client.disconnect()
-                await message.reply_text(f"❌ 2FA Password Required for `{phone}` but none provided!")
+                await event.reply(f"❌ 2FA Password Required for `{phone}` but none provided!")
                 state["state"] = None
-                await process_next_bulk_account(client, user_id, message)
-
+                await process_next_bulk_account(bot, user_id, event)
         except Exception as e:
             await acc_client.disconnect()
-            await message.reply_text(f"❌ Failed to sign in `{phone}`: {str(e)}")
+            await event.reply(f"❌ Failed to sign in `{phone}`: {str(e)}")
             state["state"] = None
-            await process_next_bulk_account(client, user_id, message)
+            await process_next_bulk_account(bot, user_id, event)
         return
 
     if state["state"] == "awaiting_country_name" and is_owner:
         state["temp_country_name"] = text.strip()
         state["state"] = "awaiting_country_code"
-        await message.reply_text("📞 Enter Country Code (e.g. +91, +1, +62):")
+        await event.reply("📞 Enter Country Code (e.g. +91, +1, +62):")
         return
 
     elif state["state"] == "awaiting_country_code" and is_owner:
         state["temp_country_code"] = text.strip()
         state["state"] = "awaiting_acc_phone"
-        await message.reply_text(f"📱 Enter full phone number with country code (e.g. {state['temp_country_code']}9876543210):")
+        await event.reply(f"📱 Enter full phone number with country code (e.g. {state['temp_country_code']}9876543210):")
         return
 
     if state["state"] == "awaiting_acc_phone" and is_owner:
         phone = text.strip()
         state["temp_phone"] = phone
         state["state"] = "awaiting_acc_price"
-        await message.reply_text(f"Phone `{phone}` saved. Now enter selling PRICE for this account (e.g. 50):")
+        await event.reply(f"Phone `{phone}` saved. Now enter selling PRICE for this account (e.g. 50):")
 
     elif state["state"] == "awaiting_acc_price" and is_owner:
         try:
             price = float(text.strip())
         except ValueError:
-            await message.reply_text("❌ Invalid price! Enter numbers only:")
+            await event.reply("❌ Invalid price! Enter numbers only:")
             return
-
         phone = state["temp_phone"]
-
         existing = accounts_col.find_one({"phone": phone, "status": {"$ne": "logged_out"}})
         if existing:
-            await message.reply_text(
-                f"⚠️ `{phone}` already DB me hai (Type: {existing.get('type','fresh')}).\n"
-                f"Pehle `/logout {phone}` karo."
-            )
+            await event.reply(f"⚠️ `{phone}` already DB me hai (Type: {existing.get('type','fresh')}).\n"
+                              f"Pehle `/logout {phone}` karo.")
             state["state"] = None
             return
-        
         session_folder = "sessions"
         os.makedirs(session_folder, exist_ok=True)
         session_name = f"{session_folder}/{phone.replace('+', '').replace(' ', '')}"
-
         old_client = state.get("temp_client")
         if old_client:
             await cleanup_session(session_name, old_client)
         else:
             await cleanup_session(session_name)
-        acc_client = Client(session_name, api_id=API_ID, api_hash=API_HASH)
-
+        acc_client = TelegramClient(session_name, API_ID, API_HASH)
         try:
             await acc_client.connect()
-            sent_code = await acc_client.send_code(phone)
-
+            sent_code = await acc_client.send_code_request(phone)
             state["temp_client"] = acc_client
             state["temp_code_hash"] = sent_code.phone_code_hash
             state["temp_price"] = price
             state["state"] = "awaiting_acc_otp"
-
-            await message.reply_text(f"📲 OTP sent to `{phone}`. Enter the OTP code received on that account:")
+            await event.reply(f"📲 OTP sent to `{phone}`. Enter the OTP code received on that account:")
         except Exception as e:
             await cleanup_session(session_name, acc_client)
             state["state"] = None
-            await message.reply_text(f"❌ Connection Error: `{e}`\n\nPlease try again.")
+            await event.reply(f"❌ Connection Error: `{e}`\n\nPlease try again.")
 
     elif state["state"] == "awaiting_acc_otp" and is_owner:
         otp = text.strip().replace(" ", "")
         acc_client = state["temp_client"]
         phone = state["temp_phone"]
-
         try:
-            await acc_client.sign_in(phone, state["temp_code_hash"], otp)
+            await acc_client.sign_in(phone, code=otp, phone_code_hash=state["temp_code_hash"])
             accounts_col.update_one(
                 {"phone": phone},
-                {"$set": {
-                    "phone": phone, "price": state["temp_price"],
-                    "country_name": state.get("temp_country_name", "Unknown"),
-                    "country_code": state.get("temp_country_code", "+"),
-                    "type": state.get("temp_acc_type", "fresh"),
-                    "sold": False, "2fa_password": None
-                }},
-                upsert=True
-            )
+                {"$set": {"phone": phone, "price": state["temp_price"],
+                          "country_name": state.get("temp_country_name", "Unknown"),
+                          "country_code": state.get("temp_country_code", "+"),
+                          "type": state.get("temp_acc_type", "fresh"),
+                          "sold": False, "2fa_password": None}},
+                upsert=True)
             await acc_client.disconnect()
             state["state"] = None
-            await message.reply_text(f"✅ Account `{phone}` logged in & saved to MongoDB stock successfully!")
-            
-        except SessionPasswordNeeded:
+            await event.reply(f"✅ Account `{phone}` logged in & saved to MongoDB stock successfully!")
+        except SessionPasswordNeededError:
             state["state"] = "awaiting_acc_2fa"
-            await message.reply_text("🔑 Account is protected with 2FA Password. Enter the 2FA Password:")
+            await event.reply("🔑 Account is protected with 2FA Password. Enter the 2FA Password:")
         except Exception as e:
-            await message.reply_text(f"❌ Login failed: `{e}`\nTry entering OTP again:")
+            await event.reply(f"❌ Login failed: `{e}`\nTry entering OTP again:")
 
     elif state["state"] == "awaiting_acc_2fa" and is_owner:
         password = text.strip()
         acc_client = state["temp_client"]
         phone = state["temp_phone"]
-
         try:
-            await acc_client.check_password(password)
+            await acc_client.sign_in(password=password)
             accounts_col.update_one(
                 {"phone": phone},
-                {"$set": {
-                    "phone": phone, "price": state["temp_price"],
-                    "country_name": state.get("temp_country_name", "Unknown"),
-                    "country_code": state.get("temp_country_code", "+"),
-                    "type": state.get("temp_acc_type", "fresh"),
-                    "sold": False, "2fa_password": password
-                }},
-                upsert=True
-            )
+                {"$set": {"phone": phone, "price": state["temp_price"],
+                          "country_name": state.get("temp_country_name", "Unknown"),
+                          "country_code": state.get("temp_country_code", "+"),
+                          "type": state.get("temp_acc_type", "fresh"),
+                          "sold": False, "2fa_password": password}},
+                upsert=True)
             await acc_client.disconnect()
             state["state"] = None
-            await message.reply_text(f"✅ Account `{phone}` with 2FA added to MongoDB stock successfully!")
-        except PasswordHashInvalid:
-            await message.reply_text("❌ Wrong 2FA Password! Try again:")
+            await event.reply(f"✅ Account `{phone}` with 2FA added to MongoDB stock successfully!")
+        except PasswordHashInvalidError:
+            await event.reply("❌ Wrong 2FA Password! Try again:")
 
     elif state["state"] == "awaiting_deposit_amount":
         try:
             amount = float(text.strip())
             if amount <= 0:
-                await message.reply_text("❌ Amount must be greater than 10!")
+                await event.reply("❌ Amount must be greater than 10!")
                 return
-
-            # Minimum deposit limit (e.g., ₹20 ya jo bhi aap chahein)
-            # Agar amount 20 ya usse kam hogi, toh error aayega (20 par bhi scanner nahi banega)
             if amount <= 10:
-                await message.reply_text(
-                    "❌ Minimum deposit must be greater than **₹10**!\n"
-                )
+                await event.reply("❌ Minimum deposit must be greater than **₹10**!\n")
                 return
-
             state["deposit_amount"] = amount
             state["qr_generated_at"] = datetime.now()
             state["state"] = "awaiting_deposit_ss"
-
             upi_link = f"upi://pay?pa={UPI_ID}&pn=Store&am={amount}&cu=INR"
             qr_img = qrcode.make(upi_link)
             bio = BytesIO()
             bio.name = 'qr.png'
             qr_img.save(bio, 'PNG')
             bio.seek(0)
-
-            # Scanner ke sath details aur Inline Buttons
             caption_msg = (
                 f"💳 **Payment Details:**\n\n"
                 f"💰 **Amount:** ₹{amount}\n"
@@ -2415,52 +1943,38 @@ async def handle_text(client: Client, message: Message):
                 f"3. ✅Click yes paid.\n"
                 f"4. Send SS of payment here.\n\n"
             )
-
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Yes Paid", callback_data="deposit_yes_paid"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="deposit_cancel")
-                ]
-            ])
-
-            await message.reply_photo(
-                photo=bio,
-                caption=caption_msg,
-                reply_markup=keyboard
-            )
+            keyboard = [[Button.inline("✅ Yes Paid", b"deposit_yes_paid"),
+                         Button.inline("❌ Cancel", b"deposit_cancel")]]
+            await event.reply(file=bio, message=caption_msg, buttons=keyboard)
         except ValueError:
-            await message.reply_text("❌ Invalid amount. Enter a valid number (e.g., 100):")
+            await event.reply("❌ Invalid amount. Enter a valid number (e.g., 100):")
 
-@bot.on_message(filters.photo)
-async def handle_photo(client: Client, message: Message):
-    user_id = message.from_user.id
+
+# Photo handler (Telethon routes photos through NewMessage as well)
+@bot.on(events.NewMessage())
+async def handle_photo(event: events.NewMessage.Event):
+    if not event.photo:
+        return
+    user_id = event.sender_id
     state = get_state(user_id)
-
     if state.get("state") == "awaiting_deposit_ss":
         amount = state["deposit_amount"]
-        
-        # State me file_id aur amount temporary save kar lete hain taaki baad me verify ho sake
         state["state"] = None
-        state["pending_photo_id"] = message.photo.file_id
+        state["pending_photo_id"] = event.photo
         state["pending_amount"] = amount
-
         customer_text = (
             f"📸 **Payment Screenshot Received!**\n\n"
             f"💰 **Amount:** ₹{amount}\n\n"
             f"👉 Aap apna deposit kaise verify karwana chahte hain? Niche diye gaye option me se select karein:"
         )
+        keyboard = [
+            [Button.inline("🤖 Automatic Verify & Approve", f"do_auto_verify_{amount}".encode())],
+            [Button.inline("👤 Manual Verify (Admin Check)", f"do_manual_verify_{amount}".encode())]
+        ]
+        await event.reply(customer_text, buttons=keyboard)
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🤖 Automatic Verify & Approve", callback_data=f"do_auto_verify_{amount}")
-            ],
-            [
-                InlineKeyboardButton("👤 Manual Verify (Admin Check)", callback_data=f"do_manual_verify_{amount}")
-            ]
-        ])
 
-        await message.reply_text(customer_text, reply_markup=keyboard)
-
+# ================= WEB SERVER =================
 from aiohttp import web
 
 async def handle(request):
@@ -2476,8 +1990,15 @@ async def web_server():
     await site.start()
     print(f"Web server started on port {port}")
 
-if __name__ == "__main__":
+
+async def main():
     print("Bot started with MongoDB persistence...")
+    await bot.start(bot_token=BOT_TOKEN)
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
-    bot.run()
+    print("Bot is running...")
+    await bot.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
