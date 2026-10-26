@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -19,9 +22,8 @@ from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import GetHistoryRequest, GetFullChatRequest, CheckChatInviteRequest
-from telethon.tl.functions.messages import GetChatInviteImportersRequest
 from telethon.tl.types import ChannelParticipantsSearch, InputPeerChannel, InputPeerChat
-from telethon.tl.types import ReplyKeyboardMarkup, KeyboardButton, KeyboardButtonStyle
+from telethon import Button
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -33,6 +35,7 @@ from telethon.errors import (
     PeerIdInvalidError,
     ChatAdminRequiredError,
     ChannelPrivateError,
+    MessageNotModifiedError,
 )
 from pymongo import MongoClient
 
@@ -127,7 +130,7 @@ async def extract_ss_details(photo_bytes: bytes) -> dict:
     )
 
     # ✅ FIXED: sahi model names (gemini-2.0-flash-exp + gemini-1.5-flash)
-    models_to_try = ['gemini-2.0-flash-exp', 'gemini-1.5-flash']
+    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash']
 
     for attempt in range(len(API_KEYS) * len(models_to_try)):
         model_name = models_to_try[attempt % len(models_to_try)]
@@ -196,6 +199,18 @@ async def cleanup_user_login(user_id: int):
             if client_obj:
                 await safe_disconnect(client_obj)
 
+async def safe_edit(event, text, **kwargs):
+    """event.edit() wrapper — same message edit hone pe error nahi dega."""
+    try:
+        return await event.edit(text, **kwargs)
+    except MessageNotModifiedError:
+        return None
+    except Exception as e:
+        # "message to edit not found" ya "message can't be edited" — silently ignore
+        err = str(e).lower()
+        if "not modified" in err or "can't be edited" in err or "message to edit not found" in err:
+            return None
+        raise
 
 def _lock_for(name: str) -> asyncio.Lock:
     if name not in _session_locks:
@@ -295,6 +310,26 @@ def get_user(user_id, referrer_id=None):
         users_col.insert_one(user)
     return user
 
+def styled_inline(text, data, color="primary"):
+    """Inline button with background color."""
+    btn = Button.inline(text, data)
+    btn.style = types.KeyboardButtonStyle(
+        bg_primary=(color == "primary"),
+        bg_success=(color == "success"),
+        bg_danger=(color == "danger")
+    )
+    return btn
+
+
+def styled_url(text, url, color="primary"):
+    """URL button with background color."""
+    btn = Button.url(text, url)
+    btn.style = types.KeyboardButtonStyle(
+        bg_primary=(color == "primary"),
+        bg_success=(color == "success"),
+        bg_danger=(color == "danger")
+    )
+    return btn
 
 def get_state(user_id):
     if user_id not in user_states:
@@ -322,38 +357,64 @@ async def cleanup_session(session_path: str, active_client=None):
 
 
 # ================= KEYBOARDS =================
+from telethon.tl import types
+
 def main_keyboard():
-    return ReplyKeyboardMarkup(
+    return types.ReplyKeyboardMarkup(
         rows=[
-            [
-                KeyboardButton("💳 Deposit Money", style=KeyboardButtonStyle(bg_primary=True)),
-                KeyboardButton("🛒 Buy Account", style=KeyboardButtonStyle(bg_success=True))
-            ],
-            [
-                KeyboardButton("👤 Profile", style=KeyboardButtonStyle(bg_primary=True)),
-                KeyboardButton("📊 Stats", style=KeyboardButtonStyle(bg_success=True))
-            ],
-            [
-                KeyboardButton("🛠️ Support", style=KeyboardButtonStyle(bg_danger=True))
-            ]
+            types.KeyboardButtonRow(
+                buttons=[
+                    types.KeyboardButton(
+                        text="💳 Deposit Money",
+                        type=types.ButtonTypeDefault(),
+                        style=types.KeyboardButtonStyle(bg_primary=True)
+                    ),
+                    types.KeyboardButton(
+                        text="🛒 Buy Account",
+                        type=types.ButtonTypeDefault(),
+                        style=types.KeyboardButtonStyle(bg_success=True)
+                    )
+                ]
+            ),
+            types.KeyboardButtonRow(
+                buttons=[
+                    types.KeyboardButton(
+                        text="👤 Profile",
+                        type=types.ButtonTypeDefault(),
+                        style=types.KeyboardButtonStyle(bg_primary=True)
+                    ),
+                    types.KeyboardButton(
+                        text="📊 Stats",
+                        type=types.ButtonTypeDefault(),
+                        style=types.KeyboardButtonStyle(bg_success=True)
+                    )
+                ]
+            ),
+            types.KeyboardButtonRow(
+                buttons=[
+                    types.KeyboardButton(
+                        text="🛠️ Support",
+                        type=types.ButtonTypeDefault(),
+                        style=types.KeyboardButtonStyle(bg_danger=True)
+                    )
+                ]
+            )
         ],
         resize=True,
-        single_use=False,
+        single_use=True,
         selective=False,
-        persistent=True
+        persistent=False
     )
 
 def logout_keyboard():
-    return [[Button.inline("🔴 Logout Bot Session", b"customer_logout")]]
-
+    return [[styled_inline("🔴 Logout Bot Session", b"customer_logout", "danger")]]
 
 def force_join_keyboard():
     return [
-        [Button.url("📢 Channel", CHANNEL_LINK)],
-        [Button.url("💬 Otp Group", GROUP_LINK)],
-        [Button.inline("✅ Verify / Check Join", b"check_force_join")]
+        [styled_url("📢 Channel", CHANNEL_LINK, "primary")],
+        [styled_url("💬 Otp Group", GROUP_LINK, "success")],
+        [styled_inline("✅ Verify / Check Join", b"check_force_join", "success")]
     ]
-
 
 async def get_force_join_channels():
     config = settings_col.find_one({"type": "force_join"})
@@ -364,16 +425,14 @@ async def get_force_join_channels():
         {"username": GROUP_USERNAME, "link": GROUP_LINK, "title": "💬 Otp Group"}
     ]
 
-
 async def build_force_join_keyboard():
     channels = await get_force_join_channels()
     buttons = []
     for idx, ch in enumerate(channels, 1):
         title = ch.get("title") or f"📢 Join Channel {idx}"
-        buttons.append([Button.url(title, ch["link"])])
-    buttons.append([Button.inline("✅ Verify / Check Join", b"check_force_join")])
+        buttons.append([styled_url(title, ch["link"], "primary")])
+    buttons.append([styled_inline("✅ Verify / Check Join", b"check_force_join", "success")])
     return buttons
-
 
 async def is_user_joined(client: TelegramClient, user_id: int) -> bool:
     status_config = settings_col.find_one({"type": "force_join_status"})
@@ -403,53 +462,177 @@ async def is_user_joined(client: TelegramClient, user_id: int) -> bool:
             chat_identifier = "@" + target if not target.startswith("+") else target
 
         is_verified = False
+        entity = None
+
+        # ✅ Entity resolve fail ho to BLOCK mat karo, skip karo
         try:
             entity = await client.get_entity(chat_identifier)
-            try:
-                await client(functions.channels.GetParticipantRequest(entity, user_id))
-                is_verified = True
-            except Exception:
-                is_verified = False
         except Exception as e:
-            print(f"Direct member check failed for {chat_identifier}: {e}")
+            print(f"⚠️ Entity resolve failed for {chat_identifier}: {e} — skipping")
+            continue
 
-        if not is_verified:
-            try:
-                entity = await client.get_entity(chat_identifier)
-                if isinstance(entity, types.Channel):
-                    result = await client(GetChatInviteImportersRequest(
-                        peer=entity, requested=True, offset_date=None, offset_user=types.InputUserEmpty(), limit=200
-                    ))
-                    for imp in result.importers:
-                        if imp.user_id == user_id:
-                            is_verified = True
-                            break
-            except Exception as req_err:
-                print(f"Join Request check error for {chat_identifier}: {req_err}")
+        # ✅ Sirf DEFINITE "not joined" pe block, unknown errors pe skip
+        try:
+            await client(functions.channels.GetParticipantRequest(entity, user_id))
+            is_verified = True
+        except UserNotParticipantError:
+            is_verified = False
+        except Exception as e:
+            print(f"⚠️ Participant check error for {chat_identifier}: {e} — skipping")
+            continue
 
+        # Fallback check
         if not is_verified and link and link != target:
             try:
                 fallback_target = link.split("t.me/")[-1].replace("/", "")
                 if not fallback_target.startswith("+"):
-                    entity = await client.get_entity("@" + fallback_target)
+                    fb_entity = await client.get_entity("@" + fallback_target)
                     try:
-                        await client(functions.channels.GetParticipantRequest(entity, user_id))
+                        await client(functions.channels.GetParticipantRequest(fb_entity, user_id))
                         is_verified = True
+                    except UserNotParticipantError:
+                        pass
                     except Exception:
                         pass
             except Exception:
                 pass
 
+        # ✅ Sirf genuinely "not joined" pe block
         if not is_verified:
             return False
 
     return True
 
+# ================= BOT ON/OFF SYSTEM =================
+def get_bot_status():
+    """Returns (is_off, message)."""
+    config = settings_col.find_one({"type": "bot_status"})
+    if config and config.get("status") == "off":
+        return True, config.get("message", "🔴 Bot is currently under maintenance. Please try again later.")
+    return False, None
+
+
+@bot.on(events.NewMessage(pattern=r"^/botoff"))
+async def bot_off_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
+        return
+    input_text = event.text.split(maxsplit=1)
+    if len(input_text) < 2:
+        await event.reply(
+            "⚠️ <b>Format:</b>\n"
+            "<code>/botoff &lt;your message&gt;</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/botoff Bot is under maintenance. Back in 1 hour.</code>",
+            parse_mode='html'
+        )
+        return
+    off_msg = input_text[1].strip()
+    settings_col.update_one(
+        {"type": "bot_status"},
+        {"$set": {"status": "off", "message": off_msg, "off_at": datetime.now()}},
+        upsert=True
+    )
+    await event.reply(
+        f"🔴 <b>Bot OFF Ho Gaya!</b>\n\n"
+        f"📝 <b>Non-owner users ko yeh message dikhega:</b>\n"
+        f"<blockquote>{off_msg}</blockquote>\n\n"
+        f"🟢 Wapas ON karne ke liye: <code>/boton</code>",
+        parse_mode='html'
+    )
+
+@bot.on(events.NewMessage(pattern=r"^/boton"))
+async def bot_on_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
+        return
+    
+    input_text = event.text.split(maxsplit=1)
+    on_msg = input_text[1].strip() if len(input_text) > 1 else None
+    
+    update_data = {"status": "on", "on_at": datetime.now()}
+    if on_msg:
+        update_data["on_message"] = on_msg
+    
+    settings_col.update_one(
+        {"type": "bot_status"},
+        {"$set": update_data},
+        upsert=True
+    )
+    
+    if on_msg:
+        await event.reply(
+            f"🟢 <b>Bot ON Ho Gaya!</b>\n\n"
+            f"📝 <b>Users ko yeh message broadcast hoga:</b>\n"
+            f"<blockquote>{on_msg}</blockquote>\n\n"
+            f"📢 Broadcasting to all users...",
+            parse_mode='html'
+        )
+        
+        # Broadcast "bot is back online" message to all users
+        all_users = list(users_col.find({}, {"user_id": 1}))
+        success = 0
+        failed = 0
+        for u in all_users:
+            uid = u.get("user_id")
+            if not uid:
+                continue
+            try:
+                await bot.send_message(
+                    uid,
+                    f"🟢 <b>Bot is back online!</b>\n\n"
+                    f"<blockquote>{on_msg}</blockquote>",
+                    parse_mode='html'
+                )
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+        
+        await event.reply(
+            f"✅ <b>Broadcast Complete!</b>\n\n"
+            f"🟢 <b>Delivered:</b> <code>{success}</code>\n"
+            f"🔴 <b>Failed:</b> <code>{failed}</code>\n"
+            f"📊 <b>Total:</b> <code>{len(all_users)}</code>",
+            parse_mode='html'
+        )
+    else:
+        await event.reply(
+            "🟢 <b>Bot ON Ho Gaya!</b>\n\n"
+            "✅ Ab sabhi users bot use kar sakte hain.\n\n"
+            "💡 <i>Tip: <code>/boton &lt;message&gt;</code> se users ko notification bhi bhej sakte hain.</i>",
+            parse_mode='html'
+        )
+
+@bot.on(events.NewMessage(pattern=r"^/botstatus"))
+async def bot_status_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS:
+        return
+    is_off, off_msg = get_bot_status()
+    if is_off:
+        await event.reply(
+            f"🔴 <b>Bot Status:</b> OFF\n\n"
+            f"📝 <b>Current Message:</b>\n"
+            f"<blockquote>{off_msg}</blockquote>",
+            parse_mode='html'
+        )
+    else:
+        await event.reply("🟢 <b>Bot Status:</b> ON\n\n✅ Sab users use kar sakte hain.", parse_mode='html')
 
 # ================= START COMMAND =================
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def start_cmd(event: events.NewMessage.Event):
     user_id = event.sender_id
+
+    # ✅ Bot off check (non-owner)
+    if user_id not in OWNER_IDS:
+        is_off, off_msg = get_bot_status()
+        if is_off:
+            await event.reply(
+                f"⚠️ <b>Bot Under Maintenance</b>\n\n"
+                f"<blockquote>{off_msg}</blockquote>",
+                parse_mode='html'
+            )
+            return
+
     first_name = (await event.get_sender()).first_name
 
     referrer_id = None
@@ -538,9 +721,9 @@ async def add_single_acc_cmd(event: events.NewMessage.Event):
     if event.sender_id not in OWNER_IDS:
         return
     keyboard = [
-        [Button.inline("🔥 Spam Account", b"add_type_spam"),
-         Button.inline("🌱 Fresh Account", b"add_type_fresh")],
-        [Button.inline("🆕 New Registered", b"add_type_registered")]
+        [styled_inline("🔥 Spam Account", b"add_type_spam", "danger"),
+         styled_inline("🌱 Fresh Account", b"add_type_fresh", "success")],
+        [styled_inline("🆕 New Registered", b"add_type_registered", "primary")]
     ]
     await event.reply("🌍 **[Owner]** Select Account Type:", buttons=keyboard)
 
@@ -1006,20 +1189,31 @@ async def broadcast_cmd(event: events.NewMessage.Event):
                        [c["chat_id"] for c in all_chats if "chat_id" in c]))
     success = 0; failed = 0
     for chat_id in targets:
+        
         try:
             if reply_msg:
-                await reply_msg.forward_to(chat_id)
+                # Agar reply me sirf text hai → quote ke saath bhejo
+                if reply_msg.text and not reply_msg.media:
+                    quoted_text = f"<blockquote>{reply_msg.text}</blockquote>"
+                    await bot.send_message(chat_id, quoted_text, parse_mode='html', link_preview=True)
+                else:
+                    # Media reply (photo/video/sticker) → as-is forward karo
+                    await reply_msg.forward_to(chat_id)
             else:
+                # Direct text → quote ke saath bhejo
                 broadcast_text = event.text.split(maxsplit=1)[1]
-                await bot.send_message(chat_id, broadcast_text)
+                quoted_text = f"<blockquote>{broadcast_text}</blockquote>"
+                await bot.send_message(chat_id, quoted_text, parse_mode='html', link_preview=True)
             success += 1
             await asyncio.sleep(0.05)
+        
         except (UserDeactivatedBanError, UserIsBlockedError, PeerIdInvalidError):
             users_col.delete_one({"user_id": chat_id})
             chats_col.delete_one({"chat_id": chat_id})
             failed += 1
         except Exception:
             failed += 1
+    
     await status_msg.edit(
         f"✅ **Broadcast Completed Successfully!**\n\n"
         f"🟢 **Delivered:** `{success}`\n"
@@ -1032,6 +1226,12 @@ async def broadcast_cmd(event: events.NewMessage.Event):
 @bot.on(events.CallbackQuery())
 async def callback_handler(event: events.CallbackQuery.Event):
     user_id = event.sender_id
+    if user_id not in OWNER_IDS:
+        is_off, off_msg = get_bot_status()
+        if is_off:
+            await event.answer(f"⚠️ {off_msg}", alert=True)
+            return
+
     try:
         data = event.data.decode()
     except Exception:
@@ -1063,30 +1263,60 @@ async def callback_handler(event: events.CallbackQuery.Event):
             me = await bot.get_me()
             bot_name = me.first_name.upper()
             ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
-            stylish_welcome_text = (
-                f"╔══════════════════════════╗\n"
-                f"║   💎 **WELCOME TO** 💎   ║\n"
-                f"║   **{bot_name}**          \n"
-                f"╚══════════════════════════╝\n\n"
-                f"👋 **Welcome, {sender.first_name}!**\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💎 **REFER & EARN PROGRAM** 💎\n"
-                f"├ 🎁 **Bonus Rate:** `2% Instant Cashback`\n"
-                f"├ 💸 **Kaise Kamayein:** Jab bhi aapka dost wallet me deposit karega, 2% bonus seedhe aapke wallet me add ho jayega!\n"
-                f"└ 📊 **Unlimited Earnings:** Jitna refer karoge, utna zyada profit!\n\n"
-                f"🔗 **Aapka Referral Link:**\n`{ref_link}`\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━"
+
+            # Same welcome as /start (HTML version)
+            custom_config = settings_col.find_one({"type": "custom_start_message"})
+            if custom_config and "message" in custom_config:
+                stylish_welcome_text = custom_config["message"].format(
+                    first_name=sender.first_name,
+                    bot_name=bot_name,
+                    ref_link=ref_link
+                )
+            else:
+                stylish_welcome_text = (
+                    f"<b>╔══════════════════════╗</b>\n"
+                    f"<b>║   💎 WELCOME TO 💎   ║</b>\n"
+                    f"<b>║   {bot_name}</b>\n"
+                    f"<b>╚══════════════════════╝</b>\n\n"
+                    f"👋 Hey <b>{sender.first_name}</b>, welcome aboard!\n\n"
+                    f"<blockquote>"
+                    f"🎁 <b>REFER & EARN</b>\n"
+                    f"🟢 <b>Bonus Rate:</b> <code>2% Instant Cashback</code>\n"
+                    f"🔵 <b>Kaise:</b> Jab dost wallet deposit karega, 2% bonus seedhe aapko milega\n"
+                    f"🟡 <b>Unlimited:</b> Jitna refer karoge, utna zyada profit"
+                    f"</blockquote>\n\n"
+                    f"🔗 <b>Your Referral Link:</b>\n"
+                    f"<code>{ref_link}</code>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚡ <b>Choose an option below:</b> ⚡"
+                )
+
+            # Delete old force-join message first
+            try:
+                await event.delete()
+            except Exception:
+                pass
+
+            # Send ONE new message — full welcome + keyboard (same as /start)
+            await event.respond(
+                stylish_welcome_text,
+                buttons=main_keyboard(),
+                link_preview=False,
+                parse_mode='html'
             )
-            await event.edit(stylish_welcome_text, link_preview=False)
-            await event.respond("Select an option from below:", buttons=main_keyboard())
+            return
         else:
             keyboard = await build_force_join_keyboard()
             await event.answer("❌ Aapne abhi tak saare channels/groups join nahi kiye hain!", alert=True)
-            await event.edit(
-                f"👋 **Welcome, {sender.first_name}!**\n\n"
-                "⚠️ **Bot access karne ke liye pehle hamare Channels/Groups ko join karein:**",
-                buttons=keyboard
-            )
+            try:
+                await event.edit(
+                    f"👋 <b>Welcome, {sender.first_name}!</b>\n\n"
+                    "⚠️ <b>Bot access karne ke liye pehle hamare Channels/Groups ko join karein:</b>",
+                    buttons=keyboard,
+                    parse_mode='html'
+                )
+            except Exception:
+                pass
         return
 
     elif data == "profile":
@@ -1102,7 +1332,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             f"🔗 **Your Referral Link:**\n`{ref_link}`\n\n"
             f"🎁 *Har referral deposit ka 2% aapke wallet me auto-credit hoga!*"
         )
-        await event.edit(profile_text, buttons=[[Button.inline("🔙 Back", b"back_main")]])
+        await event.edit(profile_text, buttons=[[styled_inline("🔙 Back", b"back_main", "primary")]])
 
     elif data == "stats":
         bought_count = accounts_col.count_documents({"buyer_id": user_id, "sold": True})
@@ -1114,8 +1344,9 @@ async def callback_handler(event: events.CallbackQuery.Event):
             f"🎁 **Referral Earnings (2%):** ₹{user.get('referral_profit', 0.0):.2f}"
         )
         stats_buttons = [
-            [Button.inline("👥 Referral Log", b"ref_log"), Button.inline("🛒 Purchase Log", b"purchase_log")],
-            [Button.inline("🔙 Back", b"back_main")]
+            [styled_inline("👥 Referral Log", b"ref_log", "primary"),
+             styled_inline("🛒 Purchase Log", b"purchase_log", "success")],
+            [styled_inline("🔙 Back", b"back_main", "primary")]
         ]
         await event.edit(stats_text, buttons=stats_buttons)
 
@@ -1127,7 +1358,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 text += f"{idx}. User ID: `{ref['user_id']}` | Joined: `{ref.get('start_date', 'N/A')}`\n"
         else:
             text += "Aapne abhi tak kisi ko refer nahi kiya hai."
-        await event.edit(text, buttons=[[Button.inline("🔙 Back to Stats", b"stats")]])
+        await event.edit(text, buttons=[[styled_inline("🔙 Back to Stats", b"stats", "primary")]])
 
     elif data == "purchase_log":
         purchased_accs = list(accounts_col.find({"buyer_id": user_id, "sold": True}))
@@ -1138,11 +1369,13 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 text += f"{idx}. Phone: `{masked_num}` | Price: ₹{acc['price']}\n"
         else:
             text += "Aapne abhi tak koi account buy nahi kiya hai."
-        await event.edit(text, buttons=[[Button.inline("🔙 Back to Stats", b"stats")]])
+        await event.edit(text, buttons=[[styled_inline("🔙 Back to Stats", b"stats", "primary")]])
 
     elif data == "support":
-        support_keyboard = [[Button.url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll")],
-                            [Button.inline("🔙 Back", b"back_main")]]
+        support_keyboard = [
+            [styled_url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll", "danger")],
+            [styled_inline("🔙 Back", b"back_main", "primary")]
+        ]
         await event.edit("🛠️ **Customer Support**\n\n For any issues, contact Owner by clicking the button below:", buttons=support_keyboard)
 
     elif data == "back_main":
@@ -1155,9 +1388,9 @@ async def callback_handler(event: events.CallbackQuery.Event):
             await event.answer("❌ Only the Owner can add accounts!", alert=True)
             return
         keyboard = [
-            [Button.inline("🔥 Spam Account", b"add_type_spam"),
-             Button.inline("🌱 Fresh Account", b"add_type_fresh")],
-            [Button.inline("🆕 Registered Account", b"add_type_registered")]
+            [styled_inline("🔥 Spam Account", b"add_type_spam", "danger"),
+             styled_inline("🌱 Fresh Account", b"add_type_fresh", "success")],
+            [styled_inline("🆕 Registered Account", b"add_type_registered", "primary")]
         ]
         await event.respond("🌍 **[Owner]** Select Account Type:", buttons=keyboard)
 
@@ -1174,9 +1407,9 @@ async def callback_handler(event: events.CallbackQuery.Event):
     elif data == "buy_acc":
         await cleanup_user_login(user_id)
         keyboard = [
-            [Button.inline("🔥 Spam Accounts", b"buy_type_spam"),
-             Button.inline("🌱 Fresh Accounts", b"buy_type_fresh")],
-            [Button.inline("🆕 New Registered", b"buy_type_registered")]
+            [styled_inline("🔥 Spam Accounts", b"buy_type_spam", "danger"),
+             styled_inline("🌱 Fresh Accounts", b"buy_type_fresh", "success")],
+            [styled_inline("🆕 New Registered", b"buy_type_registered", "primary")]
         ]
         await event.edit("🛒 **Select Account Category:**", buttons=keyboard)
 
@@ -1193,11 +1426,12 @@ async def callback_handler(event: events.CallbackQuery.Event):
         for c in countries:
             c_name, c_count, c_code = c["_id"], c["count"], c["code"]
             flag = get_flag_emoji(c_name)
-            btn_list.append([Button.inline(
+            btn_list.append([styled_inline(
                 f"{flag} {c_name} ({c_code}) | Stock: {c_count}",
-                f"select_country_{selected_type}_{c_name}".encode()
+                f"select_country_{selected_type}_{c_name}".encode(),
+                "primary"
             )])
-        btn_list.append([Button.inline("🔙 Back to Category", b"buy_acc")])
+        btn_list.append([styled_inline("🔙 Back to Category", b"buy_acc", "primary")])
         await event.edit(f"🛒 **Select Country ({selected_type.upper()}):**", buttons=btn_list)
 
     elif data.startswith("select_country_"):
@@ -1219,8 +1453,12 @@ async def callback_handler(event: events.CallbackQuery.Event):
         for acc in available_accs:
             phone = acc["phone"]; price = acc["price"]
             masked_num = mask_phone_number(phone, acc.get('country_code'))
-            btn_list.append([Button.inline(f"📱 {masked_num} - ₹{price}", f"buy_acc_{phone}".encode())])
-        btn_list.append([Button.inline("🔙 Back to Categories", b"buy_acc")])
+            btn_list.append([styled_inline(
+                f"📱 {masked_num} - ₹{price}",
+                f"buy_acc_{phone}".encode(),
+                "success"
+            )])
+        btn_list.append([styled_inline("🔙 Back to Categories", b"buy_acc", "primary")])
         await event.edit(f"🛒 **Available {selected_type.upper()} Accounts for {selected_country}:**", buttons=btn_list)
 
     elif data == "deposit":
@@ -1250,7 +1488,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             f"📌 **UPI ID:** `{UPI_ID}`\n\n"
             f"Kripya apne payment ka successful screenshot yahin chat me send karein."
         )
-        cancel_keyboard = [[Button.inline("❌ Cancel", b"deposit_cancel")]]
+        cancel_keyboard = [[styled_inline("❌ Cancel", b"deposit_cancel", "danger")]]
         await event.respond(instruction_text, buttons=cancel_keyboard)
         await event.answer()
         return
@@ -1372,7 +1610,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
             group_msg = (
                 f"🎉 **Payment Approved Successful (Auto)!**\n\n"
-                f"👤 **User:** {sender.mention}\n"
+                f"👤 **User:** {sender.first_name or 'User'}\n"
                 f"🆔 **User ID:** `{user_id}`\n"
                 f"💰 **Amount Added:** ₹{amount}\n"
                 f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"
@@ -1451,7 +1689,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             username = f"@{sender.username}" if sender.username else "N/A"
             admin_caption = (
                 f"💵 **New Manual Deposit Request**\n\n"
-                f"👤 **User:** {sender.mention}\n"
+                f"👤 **User:** {sender.first_name or 'User'}\n"
                 f"📛 **Username:** {username}\n"
                 f"🆔 **User ID:** `{user_id}`\n"
                 f"💰 **Amount:** ₹{amount}\n"
@@ -1462,10 +1700,11 @@ async def callback_handler(event: events.CallbackQuery.Event):
             )
             try:
                 await bot.send_file(
-                    chat_id=PAYMENT_LOG_GROUP, file=photo_file_id, caption=admin_caption,
+                    PAYMENT_LOG_GROUP, photo_file_id,
+                    caption=admin_caption,
                     buttons=[[
-                        Button.inline("✅ Approve", f"approve_dep_{user_id}_{amount}".encode()),
-                        Button.inline("❌ Reject", f"reject_dep_{user_id}_{amount}".encode())
+                        styled_inline("✅ Approve", f"approve_dep_{user_id}_{amount}".encode(), "success"),
+                        styled_inline("❌ Reject", f"reject_dep_{user_id}_{amount}".encode(), "danger")
                     ]]
                 )
             except Exception as e:
@@ -1530,8 +1769,8 @@ async def callback_handler(event: events.CallbackQuery.Event):
             f"When code arrives, press the button below to fetch OTP.\n"
             f"⏳ *Note: Aapke paas login karne ke liye 5 minute ka time hai.*",
             buttons=[
-                [Button.inline("📩 Request OTP / 2FA Code", b"fetch_otp")],
-                [Button.inline("🔙 Back to Countries", b"buy_acc")]
+                [styled_inline("📩 Request OTP / 2FA Code", b"fetch_otp", "success")],
+                [styled_inline("🔙 Back to Countries", b"buy_acc", "primary")]
             ]
         )
 
@@ -1600,7 +1839,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             acc = session_data["account"]
             user_client = session_data["client"]
             masked_num = mask_phone_number(acc['phone'], acc.get('country_code'))
-            user_mention = sender.mention
+            user_mention = sender.first_name or "User"
             username_str = f"@{sender.username}" if sender.username else "N/A"
             acc_price = acc.get("price", 0.0)
             me = await bot.get_me()
@@ -1651,7 +1890,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             txn_id = deposit_record.get("upi_txn_id") or deposit_record.get("google_txn_id") or "N/A"
         try:
             tu = await bot.get_entity(target_user_id)
-            user_mention = tu.mention
+            user_mention = tu.first_name or "User"
             username_str = f"@{tu.username}" if tu.username else "N/A"
         except Exception:
             user_mention = f"User (`{target_user_id}`)"
@@ -1681,7 +1920,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Approved Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Approved By:** {sender.mention}"
+                f"👑 **Approved By:** {sender.first_name or 'User'}"
             )
             await event.edit(log_group_msg)
             user_msg = (
@@ -1698,7 +1937,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
             now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             approval_date_str = now.strftime("%d-%m-%Y")
             approval_time_str = now.strftime("%I:%M:%S %p")
-            approved_by_info = f"{sender.mention} at {approval_date_str} {approval_time_str}"
+            approved_by_info = f"{sender.first_name or 'User'} at {approval_date_str} {approval_time_str}"
             group_approve_msg = (
                 f"🎉 **Payment Approved Successful!**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -1731,7 +1970,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"💰 **Rejected Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
                 f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
-                f"👑 **Rejected By:** {sender.mention}"
+                f"👑 **Rejected By:** {sender.first_name or 'User'}"
             )
             await event.edit(log_group_msg)
             target_user_state = get_state(target_user_id)
@@ -1755,7 +1994,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Rejected By:** {sender.mention}"
+                f"👑 **Rejected By:** {sender.first_name or 'User'}"
             )
             try:
                 await bot.send_message(PAYMENT_LOG_GROUP, group_reject_msg)
@@ -1777,6 +2016,17 @@ async def handle_text(event: events.NewMessage.Event):
         return
 
     user_id = event.sender_id
+
+    if user_id not in OWNER_IDS:
+        is_off, off_msg = get_bot_status()
+        if is_off:
+            await event.reply(
+                f"⚠️ <b>Bot Under Maintenance</b>\n\n"
+                f"<blockquote>{off_msg}</blockquote>",
+                parse_mode='html'
+            )
+            return
+        
     if not await is_user_joined(bot, user_id):
         keyboard = await build_force_join_keyboard()
         await event.reply(
@@ -1797,10 +2047,10 @@ async def handle_text(event: events.NewMessage.Event):
 
     elif text == "🛒 Buy Account":
         keyboard = [
-            [Button.inline("🔥 Spam Accounts", b"buy_type_spam"),
-             Button.inline("🌱 Fresh Accounts", b"buy_type_fresh")],
-            [Button.inline("🆕 New Registered", b"buy_type_registered")]
-        ]
+        [styled_inline("🔥 Spam Accounts", b"buy_type_spam", "danger"),
+         styled_inline("🌱 Fresh Accounts", b"buy_type_fresh", "success")],
+        [styled_inline("🆕 New Registered", b"buy_type_registered", "primary")]
+    ]
         await event.reply("🛒 **Select Account Category:**", buttons=keyboard)
         return
 
@@ -1832,13 +2082,13 @@ async def handle_text(event: events.NewMessage.Event):
             f"💵 **Total Amount Deposited:** ₹{user.get('total_deposited', 0.0):.2f}\n"
             f"🎁 **Referral Earnings (2%):** ₹{user.get('referral_profit', 0.0):.2f}"
         )
-        stats_buttons = [[Button.inline("👥 Referral Log", b"ref_log"),
-                          Button.inline("🛒 Purchase Log", b"purchase_log")]]
+        stats_buttons = [[styled_inline("👥 Referral Log", b"ref_log", "primary"),
+                          styled_inline("🛒 Purchase Log", b"purchase_log", "success")]]
         await event.reply(stats_text, buttons=stats_buttons)
         return
 
     elif text == "🛠️ Support":
-        support_keyboard = [[Button.url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll")]]
+        support_keyboard = [[styled_url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll", "danger")]]
         await event.reply("🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:",
                           buttons=support_keyboard)
         return
@@ -2007,24 +2257,41 @@ async def handle_text(event: events.NewMessage.Event):
             state["qr_generated_at"] = datetime.now()
             state["state"] = "awaiting_deposit_ss"
             upi_link = f"upi://pay?pa={UPI_ID}&pn=Store&am={amount}&cu=INR"
-            qr_img = qrcode.make(upi_link)
+            qr = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=30,      # ✅ QR bada (default 10)
+                border=0,         # ✅ White border kam (default 4)
+            )
+            qr.add_data(upi_link)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
             bio = BytesIO()
             bio.name = 'qr.png'
             qr_img.save(bio, 'PNG')
             bio.seek(0)
             caption_msg = (
-                f"💳 **Payment Details:**\n\n"
-                f"💰 **Amount:** ₹{amount}\n"
-                f"🔢 **Ref No / Note:** Deposit of ₹{amount}\n\n"
-                f"📌 **UPI ID:** `{UPI_ID}`\n\n"
-                f"1. Scan QR Code.\n"
-                f"2. Pay ₹{amount} **\n"
-                f"3. ✅Click yes paid.\n"
-                f"4. Send SS of payment here.\n\n"
+                f"<b>💳 Payment Details</b>\n\n"
+                f"<blockquote>"
+                f"💰 <b>Amount:</b> <code>₹{amount}</code>\n"
+                f"📌 <b>UPI ID:</b> <code>{UPI_ID}</code>"
+                f"</blockquote>\n\n"
+                f"<blockquote>"
+                f"<b>📖 How to Pay:</b>\n"
+                f"1️⃣ 📷 Scan QR Code\n"
+                f"2️⃣ 💸 Pay ₹{amount}\n"
+                f"3️⃣ ✅ Click Yes Paid\n"
+                f"4️⃣ 📸 Send Screenshot"
+                f"</blockquote>"
             )
-            keyboard = [[Button.inline("✅ Yes Paid", b"deposit_yes_paid"),
-                         Button.inline("❌ Cancel", b"deposit_cancel")]]
-            await event.reply(file=bio, message=caption_msg, buttons=keyboard)
+            keyboard = [[styled_inline("✅ Yes Paid", b"deposit_yes_paid", "success"),
+                         styled_inline("❌ Cancel", b"deposit_cancel", "danger")]]
+            await event.reply(
+                file=bio,
+                message=caption_msg,
+                buttons=keyboard,
+                parse_mode='html'
+            )
         except ValueError:
             await event.reply("❌ Invalid amount. Enter a valid number (e.g., 100):")
 
@@ -2035,6 +2302,17 @@ async def handle_photo(event: events.NewMessage.Event):
     if not event.photo:
         return
     user_id = event.sender_id
+
+    if user_id not in OWNER_IDS:
+        is_off, off_msg = get_bot_status()
+        if is_off:
+            await event.reply(
+                f"⚠️ <b>Bot Under Maintenance</b>\n\n"
+                f"<blockquote>{off_msg}</blockquote>",
+                parse_mode='html'
+            )
+            return
+        
     state = get_state(user_id)
     if state.get("state") == "awaiting_deposit_ss":
         amount = state["deposit_amount"]
@@ -2047,8 +2325,8 @@ async def handle_photo(event: events.NewMessage.Event):
             f"👉 Aap apna deposit kaise verify karwana chahte hain? Niche diye gaye option me se select karein:"
         )
         keyboard = [
-            [Button.inline("🤖 Automatic Verify & Approve", f"do_auto_verify_{amount}".encode())],
-            [Button.inline("👤 Manual Verify (Admin Check)", f"do_manual_verify_{amount}".encode())]
+            [styled_inline("🤖 Automatic Verify & Approve", f"do_auto_verify_{amount}".encode(), "success")],
+            [styled_inline("👤 Manual Verify (Admin Check)", f"do_manual_verify_{amount}".encode(), "primary")]
         ]
         await event.reply(customer_text, buttons=keyboard)
 
@@ -2072,12 +2350,14 @@ async def web_server():
 
 async def main():
     print("Bot started with MongoDB persistence...")
+    print(f"MONGO_URI: {'SET' if MONGO_URI else 'MISSING'}")
+    print("Connecting to Telegram...")
     await bot.start(bot_token=BOT_TOKEN)
-    loop = asyncio.get_event_loop()
-    loop.create_task(web_server())
+    print("✅ Connected to Telegram!")
+    me = await bot.get_me()
+    print(f"✅ Bot username: @{me.username}")
     print("Bot is running...")
     await bot.run_until_disconnected()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
