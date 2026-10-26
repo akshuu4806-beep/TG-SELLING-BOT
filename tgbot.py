@@ -2260,8 +2260,8 @@ async def handle_text(event: events.NewMessage.Event):
             qr = qrcode.QRCode(
                 version=None,
                 error_correction=qrcode.constants.ERROR_CORRECT_L,
-                box_size=30,      # ✅ QR bada (default 10)
-                border=0,         # ✅ White border kam (default 4)
+                box_size=25,      # ✅ QR bada (default 10)
+                border=1,         # ✅ White border kam (default 4)
             )
             qr.add_data(upi_link)
             qr.make(fit=True)
