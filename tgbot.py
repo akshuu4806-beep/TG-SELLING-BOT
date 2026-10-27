@@ -114,63 +114,131 @@ def mask_upi_id(upi: str) -> str:
     return f"{masked_name}@{domain}"
 
 
+def _detect_image_mime(data: bytes) -> str:
+    """Image ke actual magic bytes se correct MIME type detect karo."""
+    if len(data) < 12:
+        return "image/jpeg"
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    return "image/jpeg"
+
+
 async def extract_ss_details(photo_bytes: bytes) -> dict:
     global current_key_index, ai_client
 
+    if not photo_bytes or len(photo_bytes) < 500:
+        print(f"🚨 [AI] Image too small: {len(photo_bytes) if photo_bytes else 0} bytes")
+        return {"is_valid_ss": False, "upi_txn_id": "N/A", "customer_upi": "N/A",
+                "date": "N/A", "time": "N/A", "amount": None, "receiver": "N/A",
+                "_ai_status": "image_too_small"}
+
+    mime_type = _detect_image_mime(photo_bytes)
+    print(f"🖼️ [AI] MIME: {mime_type} | Size: {len(photo_bytes)} bytes")
+
     prompt = (
-        "Analyze this payment screenshot. Extract details in JSON format:\n"
-        "1. 'upi_txn_id': UPI transaction ID / UTR / Reference No (null if missing).\n"
-        "2. 'customer_upi': Sender or Customer UPI ID shown on SS (null if missing).\n"
-        "3. 'date': Payment date as shown on SS in 'YYYY-MM-DD' format. Return null if missing.\n"
-        "4. 'time': Payment time as shown on SS in 'HH:MM:SS AM/PM' or 'HH:MM' format. Return null if missing.\n"
-        "5. 'amount': Numeric payment amount shown on SS (null if missing).\n"
-        "6. 'receiver': Receiver UPI ID or Name shown on SS (null if missing).\n"
-        "7. 'is_valid_ss': true if it's a valid successful payment receipt with transaction IDs, date and time, else false.\n\n"
-        "Respond ONLY with valid JSON with keys: upi_txn_id, customer_upi, date, time, amount, receiver, is_valid_ss."
+        "You are reading a UPI payment screenshot from an Indian payment app "
+        "(GPay, PhonePe, Paytm, BHIM, etc.).\n\n"
+        "Extract these fields from visible text:\n"
+        "- upi_txn_id: UPI transaction ID / UTR / Ref No (12-digit number, look near 'UTR' or 'Txn ID')\n"
+        "- customer_upi: Sender UPI ID (like name@oksbi, 9876543210@ybl)\n"
+        "- date: Payment date in YYYY-MM-DD format\n"
+        "- time: Payment time in HH:MM:SS AM/PM format\n"
+        "- amount: Numeric amount only (no ₹, no commas)\n"
+        "- receiver: Receiver UPI ID or merchant name\n\n"
+        "Use null if field not visible. Do NOT make up values.\n"
+        "Respond ONLY with raw JSON (no markdown fences):\n"
+        '{"upi_txn_id": null, "customer_upi": null, "date": null, "time": null, "amount": null, "receiver": null}'
     )
 
-    # ✅ FIXED: sahi model names (gemini-2.0-flash-exp + gemini-1.5-flash)
-    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash']
+    last_error = "unknown"
+    
+    # ✅ FIX 1: Set correct current models as fallback
+    # These are based on the API error messages and latest documentation.
+    models_to_try = ['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview']
+    
+    print(f"ℹ️ Using model list: {models_to_try}")
 
-    for attempt in range(len(API_KEYS) * len(models_to_try)):
-        model_name = models_to_try[attempt % len(models_to_try)]
+    # Loop through the models we have
+    for model_name in models_to_try:
         try:
-            # ✅ FIXED: 25 sec timeout
-            response = await asyncio.wait_for(
-                ai_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        prompt,
-                        genai.types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg")
-                    ]
-                ),
-                timeout=25.0
+            # 🎯 KEY FIX: Use SYNC API via to_thread (as before, this was correct)
+            response = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model=model_name,
+                contents=[
+                    prompt,
+                    genai.types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg")
+                ]
             )
-            cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
-            data = json.loads(cleaned_text)
-            print(f"✅ AI success with {model_name} (key {current_key_index})")
+
+            raw = None
+            try:
+                raw = response.text
+            except Exception:
+                pass
+            if not raw:
+                try:
+                    raw = response.candidates[0].content.parts[0].text
+                except Exception:
+                    raw = None
+
+            if not raw:
+                last_error = f"empty_{model_name}"
+                print(f"⚠️ [{model_name}] empty response")
+                continue
+
+            print(f"🔎 RAW AI [{model_name}] key{current_key_index}: {raw[:400]}")
+
+            cleaned = raw.strip().replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+            if not cleaned.startswith("{"):
+                m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+                if m:
+                    cleaned = m.group(0)
+
+            data = json.loads(cleaned)
+
+            # Normalize nulls
+            for k in ["upi_txn_id", "customer_upi", "date", "time", "receiver"]:
+                v = data.get(k)
+                if v is None or str(v).strip().lower() in ["", "null", "none", "n/a",
+                                                          "not visible", "not found",
+                                                          "not readable", "unknown", "na"]:
+                    data[k] = "N/A"
+
+            data["is_valid_ss"] = all(
+                data.get(k) not in (None, "N/A")
+                for k in ["upi_txn_id", "date", "time"]
+            )
+            data["_ai_status"] = "success"
+
+            print(f"✅ AI success [{model_name}] key{current_key_index} → "
+                  f"txn={data['upi_txn_id']}, date={data['date']}, "
+                  f"time={data['time']}, amt={data.get('amount')}")
             return data
 
-        except asyncio.TimeoutError:
-            print(f"⏰ AI TIMEOUT with {model_name} (key {current_key_index}) — trying next")
         except Exception as e:
             err_msg = str(e)
-            print(f"❌ AI error [{model_name}] key {current_key_index}: {err_msg[:200]}")
+            last_error = f"{model_name}:{err_msg[:80]}"
+            print(f"❌ AI ERR [{model_name}] key{current_key_index}: {err_msg[:250]}")
 
-            # Sirf quota/rate limit pe key switch karo
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            if any(x in err_msg for x in ["429", "RESOURCE_EXHAUSTED",
+                                          "quota", "rate limit"]):
                 current_key_index = (current_key_index + 1) % len(API_KEYS)
                 ai_client = genai.Client(api_key=API_KEYS[current_key_index])
-                print(f"🔄 Switched to API key index {current_key_index}")
+                print(f"🔄 Switched to key {current_key_index}")
 
-        # Chhota delay to avoid hammering
-        await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
 
-    # Sab fail ho gaya
-    print("🚨 AI FAILED COMPLETELY — returning default")
-    return {"is_valid_ss": False, "upi_txn_id": None, "customer_upi": None,
-            "date": None, "time": None, "amount": None, "receiver": None}
-
+    print(f"🚨 AI FAILED COMPLETELY — last_error={last_error}")
+    return {"is_valid_ss": False, "upi_txn_id": "N/A", "customer_upi": "N/A",
+            "date": "N/A", "time": "N/A", "amount": None, "receiver": "N/A",
+            "_ai_status": last_error}
 
 def parse_ss_datetime(date_str: str, time_str: str):
     if not date_str or not time_str:
@@ -185,7 +253,6 @@ def parse_ss_datetime(date_str: str, time_str: str):
     except Exception as e:
         print(f"Datetime parse error: {e}")
     return None
-
 
 async def cleanup_user_login(user_id: int):
     if user_id in login_states:
@@ -804,7 +871,29 @@ async def reset_start_msg_cmd(event: events.NewMessage.Event):
     settings_col.delete_one({"type": "custom_start_message"})
     await event.reply("🔄 **Start Message Reset Ho Kar Default Wala Ho Gaya Hai!**")
 
-
+@bot.on(events.NewMessage(pattern=r"^/testai$"))
+async def test_ai_cmd(event):
+    if event.sender_id not in OWNER_IDS:
+        return
+    reply = await event.get_reply_message()
+    if not reply or not reply.photo:
+        await event.reply("❌ Kisi payment screenshot ko reply karke /testai bhejo")
+        return
+    await event.reply("⏳ Analyzing...")
+    buf = BytesIO()
+    await bot.download_media(reply.photo, file=buf)
+    raw_bytes = buf.getvalue()
+    mime = _detect_image_mime(raw_bytes)
+    data = await extract_ss_details(raw_bytes)
+    await event.reply(
+        f"📊 **DEBUG INFO**\n\n"
+        f"📦 Bytes: `{len(raw_bytes)}`\n"
+        f"🖼️ MIME: `{mime}`\n"
+        f"🤖 AI Status: `{data.get('_ai_status', '?')}`\n\n"
+        f"```json\n{json.dumps(data, indent=2)}\n```",
+        parse_mode='markdown'
+    )
+    
 @bot.on(events.NewMessage(pattern=r"^/add$"))
 async def add_single_acc_cmd(event: events.NewMessage.Event):
     if event.sender_id not in OWNER_IDS:
@@ -1679,26 +1768,64 @@ async def callback_handler(event: events.CallbackQuery.Event):
             photo_bytes = _buf.getvalue()
             print(f"📸 Downloaded {len(photo_bytes)} bytes")
 
+            # ─────────────────────────────────────────────
+            #  AI EXTRACTION
+            # ─────────────────────────────────────────────
             details = await extract_ss_details(photo_bytes)
-            upi_txn_id = details.get("upi_txn_id")
+            ai_status    = details.get("_ai_status", "unknown")
+            upi_txn_id   = details.get("upi_txn_id") or "N/A"
             customer_upi = details.get("customer_upi") or "N/A"
-            ss_date = details.get("date")
-            ss_time = details.get("time")
-            ss_amount = details.get("amount")
-            ss_receiver = details.get("receiver")
-            is_valid = details.get("is_valid_ss")
+            ss_date      = details.get("date") or "N/A"
+            ss_time      = details.get("time") or "N/A"
+            ss_amount    = details.get("amount")
+            ss_receiver  = details.get("receiver") or "N/A"
 
-            if not is_valid or not upi_txn_id or not ss_date or not ss_time:
+            print(f"📋 [AUTO] ai_status={ai_status} | txn={upi_txn_id} | "
+                  f"date={ss_date} | time={ss_time} | amt={ss_amount}")
+
+            # ─────────────────────────────────────────────
+            #  AI FAIL CHECK
+            # ─────────────────────────────────────────────
+            if ai_status != "success" and upi_txn_id == "N/A" and ss_date == "N/A":
                 state["state"] = "awaiting_deposit_ss"
                 await msg_wait.edit(
-                    "❌ **Galt ya Adhoora Screenshot!**\n\n"
-                    "Transaction ID, Date ya Time saaf nahi dikh raha hai.\n\n"
-                    "👉 **Kripya apna real aur saaf payment screenshot yahin dobara send karein:**"
+                    "⚠️ **Screenshot abhi auto-verify nahi ho paya.**\n\n"
+                    "System issue ke wajah se screenshot padh nahi paya. "
+                    "Kripya **Manual Verify** button try karein — admin khud check karega.\n\n"
+                    "👉 **Screenshot dobara send karke Manual Verify pe click karein.**"
                 )
                 return
 
+            # ─────────────────────────────────────────────
+            #  MISSING FIELD CHECK
+            # ─────────────────────────────────────────────
+            missing = []
+            if upi_txn_id == "N/A":
+                missing.append("Transaction ID / UTR")
+            if ss_date == "N/A":
+                missing.append("Date")
+            if ss_time == "N/A":
+                missing.append("Time")
+
+            if missing:
+                state["state"] = "awaiting_deposit_ss"
+                missing_list = "\n".join("• " + m for m in missing)
+                await msg_wait.edit(
+                    f"❌ **Screenshot me yeh cheezein clear nahi dikh rahi:**\n\n"
+                    f"{missing_list}\n\n"
+                    f"👉 **Full payment receipt bhejein** jisme UTR, Date, Time saaf dikh rahe hon.\n"
+                    f"📸 Screenshot **crop mat karein** — pura receipt bhejein."
+                )
+                return
+            # ─────────────────────────────────────────────
+            #  (Iske baad ka code — amount check, time check,
+            #   receiver check, duplicate check, insert,
+            #   success message, group log — SAME rehne do)
+            # ─────────────────────────────────────────────
+
             if ss_amount is not None and float(ss_amount) != float(amount):
                 state["state"] = "awaiting_deposit_ss"
+                # ...
                 await msg_wait.edit(
                     f"❌ **Amount Mismatch!** Aapne ₹{amount} ki request dali thi par SS me ₹{ss_amount} hai.\n\n"
                     "👉 **Kripya sahi amount ka real screenshot dobara send karein:**"
@@ -1820,7 +1947,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 await event.answer("❌ Session expired! Kripya dobara try karein.", alert=True)
                 return
 
-            msg_wait = await event.edit("⏳ Processing manual verification request... It takes 1 to 2 mints")
+            msg_wait = await event.edit("⏳ Processing manual verification... (10-20 seconds)")
 
             from io import BytesIO
             _buf = BytesIO()
@@ -1828,29 +1955,50 @@ async def callback_handler(event: events.CallbackQuery.Event):
             photo_bytes = _buf.getvalue()
             print(f"📸 [MANUAL] Downloaded {len(photo_bytes)} bytes")
 
+        # ✅ Retry AI once if it fully fails
             details = await extract_ss_details(photo_bytes)
-            upi_txn_id = details.get("upi_txn_id") or "N/A"
-            customer_upi = details.get("customer_upi")
-            ss_date = details.get("date") or "N/A"
-            ss_time = details.get("time") or "N/A"
+            if (
+                details.get("is_valid_ss") is False
+                and details.get("upi_txn_id") == "N/A"
+                and details.get("date") == "N/A"
+            ):
+                print("🔁 [MANUAL] AI returned all N/A — retrying once...")
+                await asyncio.sleep(1.5)
+                details = await extract_ss_details(photo_bytes)
 
+            upi_txn_id   = details.get("upi_txn_id") or "N/A"
+            customer_upi = details.get("customer_upi") or "N/A"
+            ss_date      = details.get("date") or "N/A"
+            ss_time      = details.get("time") or "N/A"
+            ss_amount    = details.get("amount")
+
+            print(f"📋 [MANUAL] Extracted → txn={upi_txn_id}, upi={customer_upi}, "
+                  f"date={ss_date}, time={ss_time}, amt={ss_amount}")
+
+        # ✅ Insert with strings, never None
             db["deposits"].update_one(
                 {"user_id": user_id, "amount": amount, "status": "pending"},
                 {"$set": {
                     "user_id": user_id,
-                    "upi_txn_id": upi_txn_id if upi_txn_id != "N/A" else None,
-                    "customer_upi": customer_upi if customer_upi else None,
-                    "amount": amount, "date": ss_date, "time": ss_time, "status": "pending"
+                    "upi_txn_id": upi_txn_id,     # "N/A" string bhi fine hai
+                    "customer_upi": customer_upi,
+                    "amount": amount,
+                    "date": ss_date,
+                    "time": ss_time,
+                    "status": "pending"
                 }},
                 upsert=True
             )
-            try:
-                await msg_wait.edit(
-                    "⏳ **Manual Request Submitted!**\n\n"
-                    "Aapka screenshot saari details ke sath admin ke paas bhej diya gaya hai. Kripya thoda intezaar karein."
-                )
-            except Exception:
-                pass
+
+            await safe_edit(msg_wait,
+                "⏳ **Manual Request Submitted!**\n\n"
+                "Aapka screenshot admin ke paas bhej diya gaya hai. Kripya intezaar karein."
+            )
+
+        # ✅ Warn admin if AI couldn't read
+            ai_failed_note = ""
+            if upi_txn_id == "N/A" and ss_date == "N/A" and ss_time == "N/A":
+                ai_failed_note = "\n\n⚠️ **AI extraction failed** — Admin please verify manually from screenshot."
 
             username = f"@{sender.username}" if sender.username else "N/A"
             admin_caption = (
@@ -1860,9 +2008,10 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"🆔 **User ID:** `{user_id}`\n"
                 f"💰 **Amount:** ₹{amount}\n"
                 f"🔢 **UPI Txn ID:** `{upi_txn_id}`\n"
-                f"💳 **Customer UPI:** `{customer_upi or 'N/A'}`\n"
+                f"💳 **Customer UPI:** `{customer_upi}`\n"
                 f"📅 **Txn Date:** `{ss_date}`\n"
                 f"⏰ **Txn Time:** `{ss_time}`"
+                f"{ai_failed_note}"
             )
             try:
                 await bot.send_file(
@@ -1875,7 +2024,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 )
             except Exception as e:
                 print(f"Admin group send err: {e}")
-
+    
         except Exception as e:
             print(f"🚨 MANUAL VERIFY CRASH: {e}")
             import traceback
@@ -2053,7 +2202,10 @@ async def callback_handler(event: events.CallbackQuery.Event):
         deposit_record = db["deposits"].find_one({"user_id": target_user_id, "amount": amount, "status": "pending"})
         txn_id = "N/A"
         if deposit_record:
-            txn_id = deposit_record.get("upi_txn_id") or deposit_record.get("google_txn_id") or "N/A"
+            raw_txn = deposit_record.get("upi_txn_id") or deposit_record.get("google_txn_id")
+            # "N/A", "none", "null", ya empty string ko ignore karo
+            if raw_txn and str(raw_txn).strip().lower() not in ["n/a", "none", "null", ""]:
+                txn_id = raw_txn
         try:
             tu = await bot.get_entity(target_user_id)
             user_mention = tu.first_name or "User"
