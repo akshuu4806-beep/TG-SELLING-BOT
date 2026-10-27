@@ -1461,10 +1461,89 @@ async def callback_handler(event: events.CallbackQuery.Event):
         btn_list.append([styled_inline("🔙 Back to Categories", b"buy_acc", "primary")])
         await event.edit(f"🛒 **Available {selected_type.upper()} Accounts for {selected_country}:**", buttons=btn_list)
 
-    elif data == "deposit":
-        state["state"] = "awaiting_deposit_amount"
-        await event.respond("💵 Enter the amount you want to deposit (e.g., 100):")
+    elif data == "deposit_home":
+        await event.answer("💳 Deposit Home")
+        sender = await event.get_sender()
+        user_mention_html = f'<a href="tg://user?id={user_id}">{sender.first_name or "User"}</a>'
 
+        # Fresh balance fetch (kyunki history ke baad update hui ho sakti hai)
+        fresh_user = get_user(user_id)
+
+        balance_text = (
+            f"<b>💳 DEPOSIT MONEY</b>\n\n"
+            f"<blockquote>"
+            f"👤 <b>User:</b> {user_mention_html}\n"
+            f"💰 <b>Current Balance:</b> <code>₹{fresh_user.get('wallet', 0.0):.2f}</code>\n"
+            f"📊 <b>Total Deposited:</b> <code>₹{fresh_user.get('total_deposited', 0.0):.2f}</code>"
+            f"</blockquote>\n\n"
+            f"👇 <b>Choose an option:</b>"
+        )
+        keyboard = [
+            [styled_inline("💳 Deposit via UPI", b"deposit_upi", "success"),
+             styled_inline("📜 History", b"deposit_history", "primary")]
+        ]
+        await event.edit(balance_text, buttons=keyboard, parse_mode='html')
+        return
+    
+    elif data == "deposit_upi":
+        await event.answer("✅ Deposit via UPI")
+        state["state"] = "awaiting_deposit_amount"
+        await event.edit(
+            f"<b>💵 Enter Deposit Amount</b>\n\n"
+            f"<blockquote>"
+            f"💰 <b>Minimum:</b> ₹11\n"
+            f"💡 <b>Example:</b> <code>100</code>, <code>500</code>, <code>1000</code>\n\n"
+            f"⚠️ <i>Sirf numbers type karein</i>"
+            f"</blockquote>",
+            buttons=[[styled_inline("❌ Cancel", b"back_main", "danger")]],
+            parse_mode='html'
+        )
+        return
+
+    elif data == "deposit_history":
+        await event.answer("📜 Loading approved deposits...")
+        deposits = list(db["deposits"].find(
+            {"user_id": user_id, "status": "approved"}
+        ).sort("_id", -1).limit(15))
+
+        if not deposits:
+            hist_text = (
+                f"<b>📜 APPROVED DEPOSIT HISTORY</b>\n\n"
+                f"<blockquote>"
+                f"❌ <b>Koi approved deposit nahi mila</b>\n\n"
+                f"👉 Pehli deposit start karein!"
+                f"</blockquote>"
+            )
+        else:
+            total_approved_amt = sum(float(d.get("amount", 0)) for d in deposits)
+            entries_lines = []
+            for idx, d in enumerate(deposits, 1):
+                amt = d.get("amount", 0)
+                dt = d.get("date") or "N/A"
+                tm = d.get("time") or "N/A"
+                txn = d.get("upi_txn_id") or "N/A"
+                entries_lines.append(
+                    f"<b>{idx}. 🟢 ₹{amt}</b>\n"
+                    f"📅 <code>{dt}</code> • ⏰ <code>{tm}</code>\n"
+                    f"🔢 <code>{txn}</code>"
+                )
+            entries_text = "\n\n".join(entries_lines)
+
+            hist_text = (
+                f"<b>📜 APPROVED DEPOSITS</b> — Last {len(deposits)}\n\n"
+                f"<blockquote>"
+                f"💰 <b>Total:</b> <code>₹{total_approved_amt:.2f}</code>\n\n"
+                f"{entries_text}"
+                f"</blockquote>"
+            )
+
+        back_kb = [
+            [styled_inline("💳 Deposit via UPI", b"deposit_upi", "success")],
+            [styled_inline("🔙 Back to Deposit", b"deposit_home", "primary")]
+        ]
+        await event.edit(hist_text, buttons=back_kb, parse_mode='html')
+        return
+    
     elif data == "deposit_cancel":
         state["state"] = None
         state["deposit_amount"] = 0.0
@@ -2041,10 +2120,25 @@ async def handle_text(event: events.NewMessage.Event):
     is_owner = (user_id in OWNER_IDS)
 
     if text == "💳 Deposit Money":
-        state["state"] = "awaiting_deposit_amount"
-        await event.reply("💵 Enter the amount you want to deposit (e.g., 100):")
-        return
+        sender = await event.get_sender()
+        user_mention_html = f'<a href="tg://user?id={user_id}">{sender.first_name or "User"}</a>'
 
+        balance_text = (
+            f"<b>💳 DEPOSIT MONEY</b>\n\n"
+            f"<blockquote>"
+            f"👤 <b>User:</b> {user_mention_html}\n"
+            f"💰 <b>Current Balance:</b> <code>₹{user.get('wallet', 0.0):.2f}</code>\n"
+            f"📊 <b>Total Deposited:</b> <code>₹{user.get('total_deposited', 0.0):.2f}</code>"
+            f"</blockquote>\n\n"
+            f"👇 <b>Choose an option:</b>"
+        )
+        keyboard = [
+            [styled_inline("💳 Deposit via UPI", b"deposit_upi", "success"),
+             styled_inline("📜 History", b"deposit_history", "primary")]
+        ]
+        await event.reply(balance_text, buttons=keyboard, parse_mode='html')
+        return
+            
     elif text == "🛒 Buy Account":
         keyboard = [
         [styled_inline("🔥 Spam Accounts", b"buy_type_spam", "danger"),
