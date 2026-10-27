@@ -18,7 +18,7 @@ except RuntimeError:
 import pycountry
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
-
+from telethon.tl.types import UpdateBotChatInviteRequester, UpdateChannelParticipant
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import GetHistoryRequest, GetFullChatRequest, CheckChatInviteRequest
@@ -434,6 +434,56 @@ async def build_force_join_keyboard():
     buttons.append([styled_inline("✅ Verify / Check Join", b"check_force_join", "success")])
     return buttons
 
+@bot.on(events.Raw(types=UpdateBotChatInviteRequester))
+async def on_join_request_raw(event):
+    """Jab koi user join request bheje, use DB me save karo."""
+    try:
+        # Peer se chat_id nikalna
+        peer = event.peer
+        chat_id = None
+        if hasattr(peer, "channel_id"):
+            chat_id = int(f"-100{peer.channel_id}")
+        elif hasattr(peer, "chat_id"):
+            chat_id = int(f"-{peer.chat_id}")
+
+        if chat_id is None:
+            return
+
+        db["join_requests"].update_one(
+            {"user_id": event.user_id, "chat_id": chat_id},
+            {
+                "$set": {
+                    "user_id": event.user_id,
+                    "chat_id": chat_id,
+                    "requested_at": datetime.now(),
+                    "status": "pending"
+                }
+            },
+            upsert=True
+        )
+        print(f"📥 Join request captured: user={event.user_id}, chat={chat_id}")
+    except Exception as e:
+        print(f"⚠️ Join request capture error: {e}")
+
+@bot.on(events.Raw(types=UpdateChannelParticipant))
+async def on_member_leave_raw(event):
+    """Jab koi user leave/kick ho, pending record delete karo."""
+    try:
+        # Sirf leave/kick events (pehle tha, ab nahi hai)
+        if event.prev_participant and not event.new_participant:
+            user_id = event.user_id
+            chat_id = int(f"-100{event.channel_id}")
+
+            deleted = db["join_requests"].delete_one({
+                "user_id": user_id,
+                "chat_id": chat_id
+            })
+
+            if deleted.deleted_count > 0:
+                print(f"🗑️ Pending cleared (leave): user={user_id}, chat={chat_id}")
+    except Exception as e:
+        print(f"⚠️ Leave event error: {e}")
+        
 async def is_user_joined(client: TelegramClient, user_id: int) -> bool:
     status_config = settings_col.find_one({"type": "force_join_status"})
     if status_config and status_config.get("status") == "off":
@@ -475,8 +525,47 @@ async def is_user_joined(client: TelegramClient, user_id: int) -> bool:
         try:
             await client(functions.channels.GetParticipantRequest(entity, user_id))
             is_verified = True
+
+            # ✅ Member hai → purana pending delete karo
+            # Iska matlab: agla verify fail hua toh dobara request deni padegi
+            _cleanup_id = None
+            if hasattr(entity, "id"):
+                if isinstance(entity, types.Channel):
+                    _cleanup_id = int(f"-100{entity.id}")
+                elif isinstance(entity, types.Chat):
+                    _cleanup_id = int(f"-{entity.id}")
+
+            if _cleanup_id is not None:
+                deleted = db["join_requests"].delete_one({
+                    "user_id": user_id,
+                    "chat_id": _cleanup_id
+                })
+                if deleted.deleted_count > 0:
+                    print(f"🧹 Pending cleared after verify: user={user_id}, chat={_cleanup_id}")
+
         except UserNotParticipantError:
+
+            # ✅ Member nahi hai — check karo pending join request hai kya
             is_verified = False
+
+            # Chat ka numeric ID nikaalna
+            numeric_id = None
+            if hasattr(entity, "id"):
+                if isinstance(entity, types.Channel):
+                    numeric_id = int(f"-100{entity.id}")
+                elif isinstance(entity, types.Chat):
+                    numeric_id = int(f"-{entity.id}")
+
+            if numeric_id is not None:
+                pending = db["join_requests"].find_one({
+                    "user_id": user_id,
+                    "chat_id": numeric_id,
+                    "status": "pending"
+                })
+                if pending:
+                    print(f"✅ Pending request found: user={user_id}, chat={numeric_id}")
+                    is_verified = True
+
         except Exception as e:
             print(f"⚠️ Participant check error for {chat_identifier}: {e} — skipping")
             continue
@@ -727,7 +816,6 @@ async def add_single_acc_cmd(event: events.NewMessage.Event):
     ]
     await event.reply("🌍 **[Owner]** Select Account Type:", buttons=keyboard)
 
-
 @bot.on(events.ChatAction())
 async def on_join_request(event):
     """Telethon join request tracking via ChatAction / Raw events"""
@@ -742,7 +830,6 @@ async def on_join_request(event):
             )
     except Exception:
         pass
-
 
 # ================= CREDIT & DEBIT =================
 @bot.on(events.NewMessage(pattern=r"^/credit"))
@@ -2138,7 +2225,7 @@ async def handle_text(event: events.NewMessage.Event):
         ]
         await event.reply(balance_text, buttons=keyboard, parse_mode='html')
         return
-            
+
     elif text == "🛒 Buy Account":
         keyboard = [
         [styled_inline("🔥 Spam Accounts", b"buy_type_spam", "danger"),
@@ -2452,6 +2539,7 @@ async def main():
     print(f"✅ Bot username: @{me.username}")
     print("Bot is running...")
     await bot.run_until_disconnected()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
