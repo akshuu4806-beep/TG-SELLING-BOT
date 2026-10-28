@@ -23,7 +23,6 @@ from telethon import TelegramClient, events, Button, functions, types
 from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import GetHistoryRequest, GetFullChatRequest, CheckChatInviteRequest
 from telethon.tl.types import ChannelParticipantsSearch, InputPeerChannel, InputPeerChat
-from telethon import Button
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -294,6 +293,29 @@ async def safe_disconnect(client):
     except Exception as e:
         print(f"disconnect err: {e}")
 
+async def safe_logout(client):
+    """Bot ke session ko REAL Telegram server se TERMINATE karo (disconnect nahi)."""
+    if not client:
+        return
+    try:
+        if not client.is_connected():
+            try:
+                await client.connect()
+            except Exception as e:
+                print(f"connect-before-logout failed: {e}")
+                return
+
+        try:
+            await client.log_out()      # ✅ REAL termination — AuthKey invalidate
+            print("🔒 [LOGOUT] Bot session terminated on Telegram servers")
+        except Exception as e:
+            print(f"⚠️ [LOGOUT] log_out failed: {e} — falling back to disconnect")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"safe_logout err: {e}")
 
 def get_available_countries(acc_type: str = "fresh"):
     pipeline = [
@@ -433,7 +455,7 @@ def main_keyboard():
                 buttons=[
                     types.KeyboardButton(
                         text="💳 Deposit Money",
-                        type=types.ButtonTypeDefault(),
+                        type=types.ButtonTypeDefault(), # 👈 Ye zaroori tha
                         style=types.KeyboardButtonStyle(bg_primary=True)
                     ),
                     types.KeyboardButton(
@@ -468,9 +490,9 @@ def main_keyboard():
             )
         ],
         resize=True,
-        single_use=True,
+        single_use=False,       # 👈 Buttons hide rahenge
         selective=False,
-        persistent=False
+        persistent=False       # 👈 Grid icon dikhega
     )
 
 def logout_keyboard():
@@ -683,18 +705,70 @@ async def bot_off_cmd(event: events.NewMessage.Event):
         )
         return
     off_msg = input_text[1].strip()
+
+    # ✅ 1. Save to DB
     settings_col.update_one(
         {"type": "bot_status"},
         {"$set": {"status": "off", "message": off_msg, "off_at": datetime.now()}},
         upsert=True
     )
-    await event.reply(
+
+    # ✅ 2. Owner ko QUOTE me confirmation (reply_to = command message)
+    status_msg = await event.reply(
         f"🔴 <b>Bot OFF Ho Gaya!</b>\n\n"
-        f"📝 <b>Non-owner users ko yeh message dikhega:</b>\n"
+        f"📝 <b>Message:</b>\n"
         f"<blockquote>{off_msg}</blockquote>\n\n"
-        f"🟢 Wapas ON karne ke liye: <code>/boton</code>",
-        parse_mode='html'
+        f"📢 Broadcasting to all users...",
+        parse_mode='html',
+        reply_to=event.message   # 👈 QUOTE
     )
+
+    # ✅ 3. Reply-based media support (agar owner ne kisi message ko reply karke /botoff bheja)
+    replied = await event.get_reply_message()
+
+    # ✅ 4. SABHI USERS KO BROADCAST
+    all_users = list(users_col.find({}, {"user_id": 1}))
+    success = 0
+    failed = 0
+
+    for u in all_users:
+        uid = u.get("user_id")
+        if not uid:
+            continue
+        try:
+            # Text message (quoted style)
+            await bot.send_message(
+                uid,
+                f"🔴 <b>Bot is Offline</b>\n\n"
+                f"<blockquote>{off_msg}</blockquote>",
+                parse_mode='html'
+            )
+            # Agar owner ne koi message reply karke /botoff bheja hai, toh woh bhi forward karo
+            if replied:
+                try:
+                    await replied.forward_to(uid)
+                except Exception:
+                    pass
+            success += 1
+            await asyncio.sleep(0.05)   # Rate limit safe
+        except Exception as e:
+            # Blocked/deactivated users — ignore
+            failed += 1
+
+    # ✅ 5. Confirmation UPDATE karo with broadcast results
+    try:
+        await status_msg.edit(
+            f"🔴 <b>Bot OFF Ho Gaya!</b>\n\n"
+            f"📝 <b>Message:</b>\n"
+            f"<blockquote>{off_msg}</blockquote>\n\n"
+            f"✅ <b>Broadcast Complete!</b>\n"
+            f"🟢 <b>Delivered:</b> <code>{success}</code>\n"
+            f"🔴 <b>Failed:</b> <code>{failed}</code>\n"
+            f"📊 <b>Total:</b> <code>{len(all_users)}</code>",
+            parse_mode='html'
+        )
+    except Exception as e:
+        print(f"Edit status error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/boton"))
 async def bot_on_cmd(event: events.NewMessage.Event):
@@ -773,7 +847,518 @@ async def bot_status_cmd(event: events.NewMessage.Event):
     else:
         await event.reply("🟢 <b>Bot Status:</b> ON\n\n✅ Sab users use kar sakte hain.", parse_mode='html')
 
-# ================= START COMMAND =================
+# ================= PREMIUM EMOJI HELPER =================
+# Apni emoji IDs yahan paste karo (@EmojiIDBot se)
+PREMIUM_EMOJI_IDS = {
+    "💎": "5309958691854754293",
+    "👋": "5368324170671202286",
+    "🎁": "5368324170671202286",
+    "🔗": "5368324170671202286",
+    "⚡": "5368324170671202286",
+    "🟢": "",
+    "🔵": "",
+    "🟡": "",
+}
+
+
+def pe(emoji: str, is_premium: bool) -> str:
+    if is_premium:
+        emoji_id = PREMIUM_EMOJI_IDS.get(emoji, "")
+        if emoji_id:
+            return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
+    return emoji
+
+def get_support_usernames():
+    config = settings_col.find_one({"type": "support_settings"})
+    if config and "usernames" in config:
+        return config["usernames"]
+    return ["ll_its_rudransh_ll"]  # Default username (agar koi set nahi hai)
+
+def apply_premium_emojis_to_text(text: str, is_premium: bool) -> str:
+    """Custom message ke emojis ko premium emoji tags me convert karo"""
+    text = re.sub(r'<tg-emoji[^>]*>([^<]+)</tg-emoji>', r'\1', text)
+    if not is_premium:
+        return text
+    result = text
+    for emoji, emoji_id in PREMIUM_EMOJI_IDS.items():
+        if emoji_id and emoji in result:
+            result = result.replace(
+                emoji,
+                f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
+            )
+    return result
+# ========================================================
+async def process_telegram_message(user_id, msg, session_data):
+    text = msg.text or ""
+    acc = session_data["account"]
+    masked_num = mask_phone_number(acc["phone"], acc.get('country_code'))
+    two_fa = acc.get("2fa_password") or "None"
+    
+    otp_code = extract_otp(text)
+    user = users_col.find_one({"user_id": user_id})
+    is_owner = (user_id in OWNER_IDS)
+    
+    # 1. Agar OTP aaya
+    if otp_code != "NOT-FOUND":
+        session_data["last_otp_time"] = datetime.now().timestamp() 
+        session_data["otp_received_at"] = datetime.now().timestamp()  
+        session_data["warning_count"] = 0 
+        if not session_data.get("is_logged_in", False):
+            if not is_owner:
+                new_wallet = float(user.get("wallet", 0)) - float(acc["price"])
+                users_col.update_one({"user_id": int(user_id)}, {"$set": {"wallet": new_wallet}, "$inc": {"total_spent": float(acc["price"])}})
+            accounts_col.update_one({"phone": acc["phone"]}, {"$set": {"sold": True, "buyer_id": int(user_id)}})
+            session_data["is_logged_in"] = True
+            
+        # 👇 Naya message nahi bhejenge, purane number wale message ko edit karenge
+        msg_id = session_data.get("msg_id")
+        otp_text = (
+            f"📩 **Login Verification Code:**\n\n"
+            f"📱 **Phone:** `{masked_num}`\n"
+            f"🔑 **OTP:** `{otp_code}`\n"
+            f"🔐 **2FA Password:** `{two_fa}`\n\n"
+            f"💡 *Agar code expire ho jaye, toh Telegram me 'Send Code' dabakar yahan 'Check New Messages' par click karein.*"
+        )
+        
+        if msg_id:
+            try:
+                await bot.edit_message(
+                    user_id, msg_id, otp_text,
+                    buttons=[[styled_inline("🔄 Check New Messages", b"fetch_otp", "success")]]
+                )
+                print(f"✅ [OTP] Message edited (id={msg_id})")
+            except Exception as e:
+                print(f"⚠️ [OTP] Edit failed: {e} — sending new")
+                sent_new = await bot.send_message(
+                    user_id, otp_text,
+                    buttons=[[styled_inline("🔄 Check New Messages", b"fetch_otp", "success")]]
+                )
+                # ✅ CRITICAL FIX: msg_id update karo taaki success edit sahi message pe ho
+                session_data["msg_id"] = sent_new.id
+                print(f"📝 [OTP] New message sent (id={sent_new.id}) — msg_id updated")
+        else:
+            # msg_id hi nahi tha — send new + save
+            sent_new = await bot.send_message(
+                user_id, otp_text,
+                buttons=[[styled_inline("🔄 Check New Messages", b"fetch_otp", "success")]]
+            )
+            session_data["msg_id"] = sent_new.id
+            print(f"📝 [OTP] No msg_id — sent new (id={sent_new.id}) — msg_id saved")
+        
+     # 2. Agar "New Login" alert aaya (Login successful) — Option B: Auto-Disconnect
+    else:
+        # ---- Login Alert Detection (ROBUST) ----
+        text_lower = text.lower()
+        is_login_alert = (
+            "new login" in text_lower or
+            "naya login" in text_lower or
+            "login into your account" in text_lower or
+            "login successful" in text_lower or
+            "logged in" in text_lower or
+            "signed in" in text_lower or
+            "new sign-in" in text_lower or
+            "new signin" in text_lower or
+            "device added" in text_lower or
+            "active sessions" in text_lower or
+            ("login" in text_lower and "device" in text_lower) or
+            ("login" in text_lower and "terminate" in text_lower) or
+            ("login" in text_lower and "session" in text_lower)
+        )
+
+        if not is_login_alert:
+            # Normal SMS — send to user
+            await bot.send_message(
+                user_id,
+                f"📩 **New Message Received:**\n\n"
+                f"📱 **Phone:** `{masked_num}`\n"
+                f"💬 **Message:** `{text[:500]}`",
+                buttons=[
+                    [styled_inline("🔄 Check New Messages", b"fetch_otp", "success")],
+                    [styled_inline("🔴 Logout Bot Session", b"customer_logout", "danger")]
+                ]
+            )
+            return
+
+        # ============ SUCCESS BRANCH ============
+        print(f"🎉 [LOGIN] Success detected for user={user_id}")
+
+        if session_data.get("session_terminated"):
+            print(f"⚠️ [LOGIN] Already terminated, skipping")
+            return
+
+        session_data["session_terminated"] = True
+        session_data["login_verified"] = True
+
+        user_client_now = session_data.get("client")
+        if user_client_now:
+            await safe_logout(user_client_now)
+
+        if not session_data.get("is_logged_in", False):
+            if not is_owner:
+                new_wallet = float(user.get("wallet", 0)) - float(acc["price"])
+                users_col.update_one({"user_id": int(user_id)}, {"$set": {"wallet": new_wallet}, "$inc": {"total_spent": float(acc["price"])}})
+            accounts_col.update_one({"phone": acc["phone"]}, {"$set": {"sold": True, "buyer_id": int(user_id)}})
+            session_data["is_logged_in"] = True
+
+        # ✅ Purchase log ALAG karo — `purchase_logged` flag se (double send nahi hoga)
+        if not session_data.get("purchase_logged"):
+            session_data["purchase_logged"] = True
+
+            try:
+                tg_user = await bot.get_entity(user_id)
+                user_mention = tg_user.first_name or "User"
+                username_str = f"@{tg_user.username}" if tg_user.username else "N/A"
+            except Exception:
+                user_mention = "User"
+                username_str = "N/A"
+
+            acc_price = acc.get("price", 0.0)
+            try:
+                me = await bot.get_me()
+                bot_username = me.username
+            except Exception:
+                bot_username = "N/A"
+
+            group_msg = (
+                f"🎉 **New Purchase Successful**\n\n"
+                f"👤 **User:** {user_mention}\n"
+                f"📛 **Username:** {username_str}\n"
+                f"🆔 **User ID:** `{user_id}`\n"
+                f"📱 **Account Number:** `{masked_num}`\n"
+                f"💰 **Price:** ₹{acc_price}\n\n"
+                f"✨ **Thanks for purchase!**\n\n"
+                f"🤖 **Bot:** @{bot_username}"
+            )
+            try:
+                await bot.send_message(OTP_GROUP_ID, group_msg, link_preview=False)
+                print(f"✅ [LOGIN] Purchase log sent")
+            except Exception as ge:
+                print(f"Purchase log send err: {ge}")
+
+        # ---- Send SUCCESS message (multiple fallbacks) ----
+        msg_id = session_data.get("msg_id")
+        success_text = (
+            f"🎉 **Login Successful Detected!**\n\n"
+            f"📱 **Phone:** `{masked_num}`\n\n"
+            f"✅ Aapne successfully Telegram me login kar liya hai!\n"
+            f"🔐 **2FA Password:** `{two_fa}`\n\n"
+            f"*🔒 Bot ka session Telegram server se TERMINATE kar diya gaya hai. "
+            f"Ab 'Active Sessions' me sirf aapka device dikhega.*"
+        )        
+        sent_ok = False
+        if msg_id:
+            for attempt in range(3):
+                try:
+                    await bot.edit_message(user_id, msg_id, success_text, buttons=[])
+                    sent_ok = True
+                    print(f"✅ [LOGIN] Success edited (attempt {attempt+1})")
+                    break
+                except MessageNotModifiedError:
+                    sent_ok = True
+                    break
+                except Exception as e:
+                    err_lower = str(e).lower()
+                    print(f"⚠️ [LOGIN] Edit attempt {attempt+1} failed: {e}")
+
+                    # ✅ Same fallback — reply markup invalid hone pe buttons hata ke edit
+                    if "reply markup" in err_lower or "reply_markup" in err_lower or "markup is invalid" in err_lower:
+                        try:
+                            await bot.edit_message(user_id, msg_id, success_text)
+                            sent_ok = True
+                            print(f"✅ [LOGIN] Success edited (kept old buttons) attempt {attempt+1}")
+                            break
+                        except Exception as e2:
+                            print(f"⚠️ [LOGIN] Fallback edit also failed: {e2}")
+
+                    await asyncio.sleep(1)
+
+        if not sent_ok:
+            # Sirf last resort — rare case (message delete ho gaya, etc.)
+            try:
+                await bot.send_message(user_id, success_text)
+                print(f"⚠️ [LOGIN] Last resort: sent new message")
+            except Exception as e:
+                print(f"🚨 [LOGIN] send also failed: {e}")
+
+        # Disconnect and cleanup
+        if user_id in login_states:
+            del login_states[user_id]
+
+async def get_active_sessions_hash(client):
+    """Account ke saare active sessions ke hashes ki set return karta hai."""
+    try:
+        result = await client(functions.account.GetAuthorizationsRequest())
+        return {auth.hash for auth in result.authorizations}
+    except Exception as e:
+        print(f"⚠️ [SESSION] GetAuthorizations failed: {e}")
+        return None
+
+
+async def send_login_success_message(user_id, session_data):
+    """Login success message bhejo (edit + fallback)."""
+    acc = session_data.get("account", {})
+    masked_num = mask_phone_number(acc.get("phone", ""), acc.get("country_code"))
+    two_fa = acc.get("2fa_password") or "None"
+
+    success_text = (
+        f"🎉 **Login Successful Detected!**\n\n"
+        f"📱 **Phone:** `{masked_num}`\n\n"
+        f"✅ Aapne successfully Telegram me login kar liya hai!\n"
+        f"🔐 **2FA Password:** `{two_fa}`\n\n"
+        f"*🔒 Bot ka session Telegram server se TERMINATE kar diya gaya hai. "
+        f"Ab 'Active Sessions' me sirf aapka device dikhega.*"
+    )
+
+    msg_id = session_data.get("msg_id")
+    sent_ok = False
+    if msg_id:
+        for attempt in range(3):
+            try:
+                await bot.edit_message(user_id, msg_id, success_text, buttons=[])
+                sent_ok = True
+                print(f"✅ [LOGIN] Success edited with cleared buttons (attempt {attempt+1})")
+                break
+            except MessageNotModifiedError:
+                sent_ok = True
+                break
+            except Exception as e:
+                err_lower = str(e).lower()
+                print(f"⚠️ [LOGIN] Edit attempt {attempt+1} failed: {e}")
+
+                # ✅ FIX: Agar "reply markup is invalid" hai — buttons=[] hata ke edit karo
+                if "reply markup" in err_lower or "reply_markup" in err_lower or "markup is invalid" in err_lower:
+                    try:
+                        await bot.edit_message(user_id, msg_id, success_text)
+                        sent_ok = True
+                        print(f"✅ [LOGIN] Success edited (kept old buttons) attempt {attempt+1}")
+                        break
+                    except Exception as e2:
+                        print(f"⚠️ [LOGIN] Fallback edit also failed: {e2}")
+
+                await asyncio.sleep(1)
+
+    if not sent_ok:
+        try:
+            await bot.send_message(user_id, success_text)
+            print(f"⚠️ [LOGIN] Last resort: sent new message")
+        except Exception as e:
+            print(f"🚨 [LOGIN] send also failed: {e}")
+
+async def background_message_checker():
+    print("🔄 Background Message Checker Started (15s loop)...")
+    while True:
+        await asyncio.sleep(15)
+        if not login_states:
+            continue
+
+        for user_id, session_data in list(login_states.items()):
+            user_client = session_data.get("client")
+            if not user_client:
+                continue
+
+            # Auto-reconnect if disconnected
+            if not user_client.is_connected():
+                try:
+                    await user_client.connect()
+                    print(f"🔌 Reconnected for user={user_id}")
+                except Exception as e:
+                    print(f"❌ Reconnect failed for user={user_id}: {e}")
+                    continue
+
+            try:
+                # ─── 1. MESSAGES FETCH (OTP / SMS ke liye) ───
+                last_msg_id = session_data.get("last_msg_id", 0)
+                messages = await user_client.get_messages(777000, limit=5, min_id=last_msg_id)
+
+                if messages:
+                    for msg in reversed(messages):
+                        msg_ts = msg.date.timestamp() if msg.date else 0
+                        if msg_ts < session_data.get("purchase_time", 0):
+                            continue
+                        session_data["last_msg_id"] = msg.id
+                        await process_telegram_message(user_id, msg, session_data)
+
+                # Agar message se login detect ho gaya (SMS aa gaya) → session check skip
+                if session_data.get("login_verified") or session_data.get("session_terminated"):
+                    continue
+
+                # ─── 2. NAYA: ACTIVE SESSIONS SE LOGIN DETECT ───
+                # Sirf tab check karo jab OTP aa chuka ho (wallet deducted, is_logged_in=True)
+                if session_data.get("is_logged_in", False):
+                    current_sessions = await get_active_sessions_hash(user_client)
+
+                    if current_sessions is not None:
+                        # Pehli baar → baseline save karo (kya-kya pehle se logged in hai)
+                        if "baseline_sessions" not in session_data:
+                            session_data["baseline_sessions"] = current_sessions
+                            print(f"📸 [SESSION] Baseline saved for user={user_id} ({len(current_sessions)} devices)")
+                        else:
+                            baseline = session_data["baseline_sessions"]
+                            new_devices = current_sessions - baseline
+
+                            if new_devices:
+                                print(f"🎉 [SESSION] NEW LOGIN DETECTED for user={user_id}! New hashes: {new_devices}")
+
+                                # Mark verified + terminated
+                                session_data["login_verified"] = True
+                                session_data["session_terminated"] = True
+
+                                try:
+                                    await safe_logout(user_client)
+                                except Exception as e:
+                                    print(f"⚠️ [SESSION] early log_out err: {e}")
+
+                                if not session_data.get("purchase_logged"):
+                                    session_data["purchase_logged"] = True
+                                    try:
+                                        tg_user = await bot.get_entity(user_id)
+                                        user_mention = tg_user.first_name or "User"
+                                        username_str = f"@{tg_user.username}" if tg_user.username else "N/A"
+                                    except Exception:
+                                        user_mention = "User"
+                                        username_str = "N/A"
+
+                                    acc = session_data.get("account", {})
+                                    acc_price = acc.get("price", 0.0)
+                                    masked_num = mask_phone_number(acc.get("phone", ""), acc.get("country_code"))
+
+                                    try:
+                                        me = await bot.get_me()
+                                        bot_username = me.username
+                                    except Exception:
+                                        bot_username = "N/A"
+
+                                    group_msg = (
+                                        f"🎉 **New Purchase Successful (Auto-Detected)**\n\n"
+                                        f"👤 **User:** {user_mention}\n"
+                                        f"📛 **Username:** {username_str}\n"
+                                        f"🆔 **User ID:** `{user_id}`\n"
+                                        f"📱 **Account Number:** `{masked_num}`\n"
+                                        f"💰 **Price:** ₹{acc_price}\n\n"
+                                        f"🤖 **Bot:** @{bot_username}"
+                                    )
+                                    try:
+                                        await bot.send_message(OTP_GROUP_ID, group_msg, link_preview=False)
+                                    except Exception as ge:
+                                        print(f"Purchase log send err: {ge}")
+
+                                # User ko success message
+                                await send_login_success_message(user_id, session_data)
+
+                                # Cleanup
+                                if user_id in login_states:
+                                    del login_states[user_id]
+                                continue
+
+                # ─── 3. OTP EXPIRY & STOCK RETURN ───
+                if not session_data.get("login_verified", False):
+                    otp_time = session_data.get("otp_received_at", 0)
+                    if otp_time > 0:
+                        elapsed = datetime.now().timestamp() - otp_time
+                        warning_count = session_data.get("warning_count", 0)
+
+                        # First Warning (5 min)
+                        if elapsed > 300 and warning_count == 0:
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    "⏰ **OTP Expire Ho Gaya!**\n\n"
+                                    "Aapne 5 minute tak login nahi kiya. **Code 5 minute mein expire ho jayega.**\n\n"
+                                    "Kripya apne Telegram app me **'Send Code'** par click karein, "
+                                    "aur phir yahan **'🔄 Check New Messages'** par click karein.\n\n"
+                                    f"📱 *Phone: `{session_data['account']['phone']}`*",
+                                    buttons=[
+                                        [styled_inline("🔄 Check New Messages", b"fetch_otp", "success")]
+                                    ]
+                                )
+                                session_data["warning_count"] = 1
+                            except Exception as e:
+                                print(f"First warning err: {e}")
+
+                        # Second Warning (10 min) — Refund
+                        elif elapsed > 600 and warning_count == 1:
+                            try:
+                                acc = session_data.get("account", {})
+                                phone = acc.get("phone")
+                                price = float(acc.get("price", 0.0))
+
+                                if phone:
+                                    accounts_col.update_one(
+                                        {"phone": phone},
+                                        {"$set": {"sold": False}, "$unset": {"buyer_id": ""}}
+                                    )
+                                    _busy_phones.discard(phone)
+
+                                if user_id not in OWNER_IDS and price > 0:
+                                    users_col.update_one(
+                                        {"user_id": int(user_id)},
+                                        {"$inc": {"wallet": price, "total_spent": -price}}
+                                    )
+
+                                await bot.send_message(
+                                    user_id,
+                                    f"❌ **Account Stock Me Wapas Chala Gaya!**\n\n"
+                                    f"Aapne 10 minute tak login nahi kiya, isliye account wapas stock me add kar diya gaya hai.\n\n"
+                                    f"💰 **Refund:** ₹{price:.2f} aapke wallet me wapas aa gaye hain.\n\n"
+                                    f"📱 *Phone: `{phone}`*\n\n"
+                                    f"👉 *Naya account lene ke liye 'Buy Account' par click karein.*"
+                                )
+
+                                user_client_bg = session_data.get("client")
+                                if user_client_bg:
+                                    await safe_disconnect(user_client_bg)
+
+                                if user_id in login_states:
+                                    del login_states[user_id]
+
+                            except Exception as e:
+                                print(f"Second warning err: {e}")
+
+            except Exception as e:
+                print(f"Auto-checker error for {user_id}: {e}")            
+
+
+async def typewriter_effect(event, final_text, buttons=None):
+    # HTML tags hata kar plain text banate hain
+    plain_text = re.sub(r'<[^>]+>', '', final_text)
+    msg = None
+    
+    try:
+        # 1. Turant message bhejo buttons ke saath taaki grid icon load ho jaye
+        msg = await event.respond(" ▌", buttons=buttons)
+    except Exception:
+        pass
+
+    if msg:
+        typed_text = ""
+        chunk_size = 5
+        
+        for i in range(0, len(plain_text), chunk_size):
+            typed_text += plain_text[i:i+chunk_size]
+            try:
+                await msg.edit(typed_text + " ▌")
+            except Exception:
+                # Agar message delete ho jaye ya rate limit lag jaye, toh typing rok do
+                break 
+            await asyncio.sleep(0.1) 
+            
+        try:
+            # Aakhri me pura stylish message edit karo
+            await msg.edit(final_text, buttons=buttons, parse_mode='html', link_preview=False)
+            return # Edit success, function yahin se wapas jayega
+        except Exception:
+            # Agar final edit fail ho jaye (message invalid ho gaya), toh purane adhure msg ko delete karo
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+    # 2. Fallback: Agar edit nahi hua, toh bina error diye naya pura message bhej do
+    try:
+        await event.respond(final_text, buttons=buttons, parse_mode='html', link_preview=False)
+    except Exception:
+        pass
+
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def start_cmd(event: events.NewMessage.Event):
     user_id = event.sender_id
@@ -789,7 +1374,9 @@ async def start_cmd(event: events.NewMessage.Event):
             )
             return
 
-    first_name = (await event.get_sender()).first_name
+    sender = await event.get_sender()
+    first_name = sender.first_name
+    is_premium = bool(getattr(sender, "premium", False))   # ✅ Premium check
 
     referrer_id = None
     parts = event.text.split()
@@ -818,51 +1405,89 @@ async def start_cmd(event: events.NewMessage.Event):
     bot_name = me.first_name.upper()
     ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
 
+        # ✅ Typewriter Animation Logic
     custom_config = settings_col.find_one({"type": "custom_start_message"})
+
     if custom_config and "message" in custom_config:
         stylish_welcome_text = custom_config["message"].format(
             first_name=first_name, bot_name=bot_name, ref_link=ref_link
         )
+        stylish_welcome_text = apply_premium_emojis_to_text(stylish_welcome_text, is_premium)
+        await typewriter_effect(event, stylish_welcome_text, buttons=main_keyboard())
     else:
         stylish_welcome_text = (
             f"<b>╔══════════════════════╗</b>\n"
-            f"<b>║   💎 WELCOME TO 💎   ║</b>\n"
+            f"<b>║   {pe('💎', is_premium)} WELCOME TO {pe('💎', is_premium)}   ║</b>\n"
             f"<b>║   {bot_name}</b>\n"
             f"<b>╚══════════════════════╝</b>\n\n"
-            f"👋 Hey <b>{first_name}</b>, welcome aboard!\n\n"
+            f"{pe('👋', is_premium)} Hey <b>{first_name}</b>\n\n"
             f"<blockquote>"
-            f"🎁 <b>REFER & EARN</b>\n"
-            f"🟢 <b>Bonus Rate:</b> <code>2% Instant Cashback</code>\n"
-            f"🔵 <b>Kaise:</b> Jab dost wallet deposit karega, 2% bonus seedhe aapko milega\n"
-            f"🟡 <b>Unlimited:</b> Jitna refer karoge, utna zyada profit"
+            f"{pe('🎁', is_premium)} <b>REFER & EARN</b>\n"
+            f"{pe('🟢', is_premium)} <b>Bonus Rate:</b> <code>2% Instant Cashback</code>\n"
+            f"{pe('🔵', is_premium)} <b>Kaise:</b> Jab dost wallet deposit karega, 2% bonus seedhe aapko milega\n"
+            f"{pe('🟡', is_premium)} <b>Unlimited:</b> Jitna refer karoge, utna zyada profit"
             f"</blockquote>\n\n"
-            f"🔗 <b>Your Referral Link:</b>\n"
+            f"{pe('🔗', is_premium)} <b>Your Referral Link:</b>\n"
             f"<code>{ref_link}</code>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <b>Choose an option below:</b> ⚡"
+            f"{pe('⚡', is_premium)} <b>Choose an option below:</b> {pe('⚡', is_premium)}"
         )
-
-    await event.reply(stylish_welcome_text, buttons=main_keyboard(), link_preview=False, parse_mode='html')
+        await typewriter_effect(event, stylish_welcome_text, buttons=main_keyboard())
 
 @bot.on(events.NewMessage(pattern=r"^/setstartmsg"))
 async def set_start_msg_cmd(event: events.NewMessage.Event):
     if event.sender_id not in OWNER_IDS:
         return
+
+    replied = await event.get_reply_message()
     input_text = event.text.split(maxsplit=1)
-    if len(input_text) < 2:
+
+    new_msg = None
+    source_label = ""
+
+    # ✅ Priority 1: Reply-based (kisi message ko reply karke /setstartmsg)
+    if replied and replied.text:
+        new_msg = replied.text
+        source_label = "📎 Quoted message (reply)"
+    # ✅ Priority 2: Direct command text (/setstartmsg <text>)
+    elif len(input_text) >= 2:
+        new_msg = input_text[1].strip()
+        source_label = "✏️ Direct command text"
+    else:
+        # Usage guide
         await event.reply(
-            "⚠️ **Format:**\n"
-            "`/setstartmsg Aapka naya welcome message yahan likhein...`\n\n"
-            "Aap isme variables use kar sakte hain:\n"
-            "- `{first_name}`: User ka naam\n"
-            "- `{bot_name}`: Bot ka naam\n"
-            "- `{ref_link}`: Referral link"
+            "⚠️ <b>Format:</b>\n\n"
+            "1️⃣ <b>Direct:</b>\n"
+            "<code>/setstartmsg Aapka message yahan...</code>\n\n"
+            "2️⃣ <b>Reply method (recommended):</b>\n"
+            "Kisi bhi message ko <b>reply</b> karke <code>/setstartmsg</code> bhejein\n"
+            "→ Woh message hi custom start message ban jayega\n\n"
+            "🔤 <b>Variables:</b>\n"
+            "• <code>{first_name}</code> — User ka naam\n"
+            "• <code>{bot_name}</code> — Bot ka naam\n"
+            "• <code>{ref_link}</code> — Referral link",
+            parse_mode='html',
+            reply_to=event.message
         )
         return
-    new_msg = input_text[1].strip()
-    settings_col.update_one({"type": "custom_start_message"}, {"$set": {"message": new_msg}}, upsert=True)
-    await event.reply("✅ **Custom Start Message Successfully Set Ho Gaya Hai!**")
 
+    # Save to MongoDB
+    settings_col.update_one(
+        {"type": "custom_start_message"},
+        {"$set": {"message": new_msg}},
+        upsert=True
+    )
+
+    # ✅ QUOTED confirmation (Telegram me original command ke reply me dikhega)
+    await event.reply(
+        f"✅ <b>Custom Start Message Successfully Set!</b>\n\n"
+        f"📌 <b>Source:</b> {source_label}\n\n"
+        f"<blockquote>{new_msg}</blockquote>\n\n"
+        f"💡 <i>Ab users ko /start karne par yahi message dikhega.</i>\n"
+        f"🔄 <i>Reset karne ke liye: <code>/resetstartmsg</code></i>",
+        parse_mode='html',
+        reply_to=event.message   # 👈 QUOTE (jaisa /botoff me hai)
+    )
 
 @bot.on(events.NewMessage(pattern=r"^/resetstartmsg"))
 async def reset_start_msg_cmd(event: events.NewMessage.Event):
@@ -920,6 +1545,62 @@ async def on_join_request(event):
     except Exception:
         pass
 
+@bot.on(events.NewMessage(pattern=r"^/addsupport"))
+async def add_support_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS: return
+    args = event.text.split(maxsplit=1)
+    if len(args) < 2:
+        await event.reply("⚠️ **Format:** `/addsupport @username`")
+        return
+    
+    username = args[1].strip().replace("@", "").replace("https://t.me/", "")
+    if not username:
+        await event.reply("❌ Invalid username!")
+        return
+        
+    current_list = get_support_usernames()
+    if username in current_list:
+        await event.reply(f"⚠️ `@{username}` pehle se hi support list me hai!")
+        return
+        
+    current_list.append(username)
+    settings_col.update_one({"type": "support_settings"}, {"$set": {"usernames": current_list}}, upsert=True)
+    
+    await event.reply(f"✅ `@{username}` Support List me add ho gaya!\n\n📋 **Total Support IDs:** `{len(current_list)}`\n\n💡 Check karne ke liye `/listsupport` bhejein.")
+
+@bot.on(events.NewMessage(pattern=r"^/removesupport"))
+async def remove_support_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS: return
+    args = event.text.split(maxsplit=1)
+    if len(args) < 2:
+        await event.reply("⚠️ **Format:** `/removesupport @username`")
+        return
+        
+    username = args[1].strip().replace("@", "").replace("https://t.me/", "")
+    current_list = get_support_usernames()
+    
+    if username not in current_list:
+        await event.reply(f"❌ `@{username}` support list me nahi hai!")
+        return
+        
+    current_list.remove(username)
+    settings_col.update_one({"type": "support_settings"}, {"$set": {"usernames": current_list}}, upsert=True)
+    
+    await event.reply(f"🗑️ `@{username}` Support List se hata diya gaya!\n\n📋 **Baaki Support IDs:** `{len(current_list)}`")
+
+@bot.on(events.NewMessage(pattern=r"^/listsupport"))
+async def list_support_cmd(event: events.NewMessage.Event):
+    if event.sender_id not in OWNER_IDS: return
+    current_list = get_support_usernames()
+    if not current_list:
+        await event.reply("❌ Support list khaali hai!")
+        return
+        
+    text = "👑 **CURRENT SUPPORT USERNAMES:**\n\n"
+    for idx, u in enumerate(current_list, 1):
+        text += f"{idx}. `@{u}`\n"
+    await event.reply(text)
+    
 # ================= CREDIT & DEBIT =================
 @bot.on(events.NewMessage(pattern=r"^/credit"))
 async def credit_cmd(event: events.NewMessage.Event):
@@ -1095,9 +1776,9 @@ async def add_bulk_cmd(event: events.NewMessage.Event):
         await event.reply(
             "⚠️ **Format:**\n\n"
             "`/addbulk`\n"
-            "`India|+91|50|+919876543210|pass1|spam`\n"
-            "`India|+91|50|+919876543211|none|fresh`"
+            "`Country|Country code|Price|Number with code|password/None|spam/fresh/registered`"
         )
+
         return
     lines = input_text[1].strip().split("\n")
     queue = []
@@ -1397,6 +2078,27 @@ async def broadcast_cmd(event: events.NewMessage.Event):
         f"📊 **Total Attempted:** `{len(targets)}`"
     )
 
+async def log_auto_verify_failure(user_id, sender, amount, reason, upi_txn_id="N/A"):
+    """Auto-verify fail hone pe OTP_GROUP me notification bhejo."""
+    try:
+        username_str = f"@{sender.username}" if sender.username else "N/A"
+        now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        attempt_date = now.strftime("%d-%m-%Y")
+        attempt_time = now.strftime("%I:%M:%S %p")
+        failed_msg = (
+            f"⚠️ **Auto-Verify Failed!**\n\n"
+            f"👤 **User:** {sender.first_name or 'User'}\n"
+            f"📛 **Username:** {username_str}\n"
+            f"🆔 **User ID:** `{user_id}`\n"
+            f"💰 **Amount:** ₹{amount}\n"
+            f"❌ **Reason:** {reason}\n"
+            f"🔢 **Txn ID:** `{upi_txn_id or 'N/A'}`\n"
+            f"🕐 **Attempted At:** {attempt_date} {attempt_time}\n\n"
+            f"🤖 **Bot :** @DarktgOtp_bot\n"
+        )
+        await bot.send_message(OTP_GROUP_ID, failed_msg)
+    except Exception as e:
+        print(f"Auto-verify fail log err: {e}")
 
 # ================= CALLBACK HANDLER =================
 @bot.on(events.CallbackQuery())
@@ -1440,48 +2142,47 @@ async def callback_handler(event: events.CallbackQuery.Event):
             bot_name = me.first_name.upper()
             ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
 
-            # Same welcome as /start (HTML version)
+            is_premium_cb = bool(getattr(sender, "premium", False))
             custom_config = settings_col.find_one({"type": "custom_start_message"})
+            
             if custom_config and "message" in custom_config:
                 stylish_welcome_text = custom_config["message"].format(
                     first_name=sender.first_name,
                     bot_name=bot_name,
                     ref_link=ref_link
                 )
+                stylish_welcome_text = apply_premium_emojis_to_text(stylish_welcome_text, is_premium_cb)
             else:
                 stylish_welcome_text = (
                     f"<b>╔══════════════════════╗</b>\n"
-                    f"<b>║   💎 WELCOME TO 💎   ║</b>\n"
+                    f"<b>║   {pe('💎', is_premium_cb)} WELCOME TO {pe('💎', is_premium_cb)}   ║</b>\n"
                     f"<b>║   {bot_name}</b>\n"
                     f"<b>╚══════════════════════╝</b>\n\n"
-                    f"👋 Hey <b>{sender.first_name}</b>, welcome aboard!\n\n"
+                    f"{pe('👋', is_premium_cb)} Hey <b>{sender.first_name}</b>, welcome aboard!\n\n"
                     f"<blockquote>"
-                    f"🎁 <b>REFER & EARN</b>\n"
-                    f"🟢 <b>Bonus Rate:</b> <code>2% Instant Cashback</code>\n"
-                    f"🔵 <b>Kaise:</b> Jab dost wallet deposit karega, 2% bonus seedhe aapko milega\n"
-                    f"🟡 <b>Unlimited:</b> Jitna refer karoge, utna zyada profit"
+                    f"{pe('🎁', is_premium_cb)} <b>REFER & EARN</b>\n"
+                    f"{pe('🟢', is_premium_cb)} <b>Bonus Rate:</b> <code>2% Instant Cashback</code>\n"
+                    f"{pe('🔵', is_premium_cb)} <b>Kaise:</b> Jab dost wallet deposit karega, 2% bonus seedhe aapko milega\n"
+                    f"{pe('🟡', is_premium_cb)} <b>Unlimited:</b> Jitna refer karoge, utna zyada profit"
                     f"</blockquote>\n\n"
-                    f"🔗 <b>Your Referral Link:</b>\n"
+                    f"{pe('🔗', is_premium_cb)} <b>Your Referral Link:</b>\n"
                     f"<code>{ref_link}</code>\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚡ <b>Choose an option below:</b> ⚡"
+                    f"{pe('⚡', is_premium_cb)} <b>Choose an option below:</b> {pe('⚡', is_premium_cb)}"
                 )
 
-            # Delete old force-join message first
+            # Purana Force Join message delete karo
             try:
                 await event.delete()
             except Exception:
                 pass
 
-            # Send ONE new message — full welcome + keyboard (same as /start)
-            await event.respond(
-                stylish_welcome_text,
-                buttons=main_keyboard(),
-                link_preview=False,
-                parse_mode='html'
-            )
+            # 👇 Seedha Typewriter Effect start karo
+            await typewriter_effect(event, stylish_welcome_text, buttons=main_keyboard())
             return
+            
         else:
+            # Agar join nahi kiya hai toh...
             keyboard = await build_force_join_keyboard()
             await event.answer("❌ Aapne abhi tak saare channels/groups join nahi kiye hain!", alert=True)
             try:
@@ -1493,7 +2194,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 )
             except Exception:
                 pass
-        return
+            return
 
     elif data == "profile":
         me = await bot.get_me()
@@ -1547,15 +2248,31 @@ async def callback_handler(event: events.CallbackQuery.Event):
             text += "Aapne abhi tak koi account buy nahi kiya hai."
         await event.edit(text, buttons=[[styled_inline("🔙 Back to Stats", b"stats", "primary")]])
 
+    
     elif data == "support":
-        support_keyboard = [
-            [styled_url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll", "danger")],
-            [styled_inline("🔙 Back", b"back_main", "primary")]
-        ]
-        await event.edit("🛠️ **Customer Support**\n\n For any issues, contact Owner by clicking the button below:", buttons=support_keyboard)
+        usernames = get_support_usernames()
+        
+        # Agar list khaali hai toh sirf "Back" button dikhao
+        if not usernames:
+            support_keyboard = [[styled_inline("🔙 Back", b"back_main", "primary")]]
+            await event.edit(
+                "🛠️ **Customer Support**\n\n❌ **Abhi koi Support available nahi hai.**\nKripya thodi der baad try karein.", 
+                buttons=support_keyboard
+            )
+            return
+            
+        support_keyboard = []
+        for u in usernames:
+            support_keyboard.append([styled_url(f"💬 Contact @{u}", f"https://t.me/{u}", "danger")])
+            
+        support_keyboard.append([styled_inline("🔙 Back", b"back_main", "primary")])
+        
+        await event.edit(
+            "🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:", 
+            buttons=support_keyboard
+        )
 
     elif data == "back_main":
-        await cleanup_user_login(user_id)
         state["state"] = None
         await event.edit("Select an option from below:", buttons=main_keyboard())
 
@@ -1581,7 +2298,26 @@ async def callback_handler(event: events.CallbackQuery.Event):
         await event.edit(f"🌍 **[Owner - {acc_type.upper()}]** Enter Country Name (e.g. India, USA):")
 
     elif data == "buy_acc":
-        await cleanup_user_login(user_id)
+        # User ne Back dabaya — account SABKE liye free karo
+        if user_id in login_states:
+            sd = login_states[user_id]
+            phone = sd.get("account", {}).get("phone")
+
+            # OTP aane se PEHLE hi Back dabaya hai (is_logged_in == False)
+            if not sd.get("is_logged_in", False):
+                # DB me bhi confirm karo ki sold=False hai
+                if phone:
+                    accounts_col.update_one(
+                        {"phone": phone},
+                        {"$set": {"sold": False}, "$unset": {"buyer_id": ""}}
+                    )
+                # ✅ SAFAI: login_states + _busy_phones + client — sab clear
+                await cleanup_user_login(user_id)
+            else:
+                # OTP aa chuka tha — sirf busy se hataao, session mat todo
+                if phone:
+                    _busy_phones.discard(phone)
+
         keyboard = [
             [styled_inline("🔥 Spam Accounts", b"buy_type_spam", "danger"),
              styled_inline("🌱 Fresh Accounts", b"buy_type_fresh", "success")],
@@ -1590,7 +2326,6 @@ async def callback_handler(event: events.CallbackQuery.Event):
         await event.edit("🛒 **Select Account Category:**", buttons=keyboard)
 
     elif data in ["buy_type_spam", "buy_type_fresh", "buy_type_registered"]:
-        await cleanup_user_login(user_id)
         if "spam" in data: selected_type = "spam"
         elif "registered" in data: selected_type = "registered"
         else: selected_type = "fresh"
@@ -1603,15 +2338,14 @@ async def callback_handler(event: events.CallbackQuery.Event):
             c_name, c_count, c_code = c["_id"], c["count"], c["code"]
             flag = get_flag_emoji(c_name)
             btn_list.append([styled_inline(
-                f"{flag} {c_name} ({c_code}) | Stock: {c_count}",
+                f"{flag} {c_name}",
                 f"select_country_{selected_type}_{c_name}".encode(),
                 "primary"
             )])
-        btn_list.append([styled_inline("🔙 Back to Category", b"buy_acc", "primary")])
+        btn_list.append([styled_inline("🔙 Back", b"buy_acc", "primary")])
         await event.edit(f"🛒 **Select Country ({selected_type.upper()}):**", buttons=btn_list)
 
     elif data.startswith("select_country_"):
-        await cleanup_user_login(user_id)
         parts = data.split("_")
         selected_type = parts[2]
         selected_country = "_".join(parts[3:])
@@ -1634,7 +2368,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"buy_acc_{phone}".encode(),
                 "success"
             )])
-        btn_list.append([styled_inline("🔙 Back to Categories", b"buy_acc", "primary")])
+        btn_list.append([styled_inline("🔙 Back", f"buy_type_{selected_type}".encode(), "primary")])
         await event.edit(f"🛒 **Available {selected_type.upper()} Accounts for {selected_country}:**", buttons=btn_list)
 
     elif data == "deposit_home":
@@ -1794,6 +2528,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                     "Kripya **Manual Verify** button try karein — admin khud check karega.\n\n"
                     "👉 **Screenshot dobara send karke Manual Verify pe click karein.**"
                 )
+                await log_auto_verify_failure(user_id, sender, amount, "AI could not read screenshot", upi_txn_id)
                 return
 
             # ─────────────────────────────────────────────
@@ -1816,6 +2551,11 @@ async def callback_handler(event: events.CallbackQuery.Event):
                     f"👉 **Full payment receipt bhejein** jisme UTR, Date, Time saaf dikh rahe hon.\n"
                     f"📸 Screenshot **crop mat karein** — pura receipt bhejein."
                 )
+                await log_auto_verify_failure(
+                    user_id, sender, amount,
+                    f"Missing fields: {', '.join(missing)}",
+                    upi_txn_id
+                )
                 return
             # ─────────────────────────────────────────────
             #  (Iske baad ka code — amount check, time check,
@@ -1830,6 +2570,11 @@ async def callback_handler(event: events.CallbackQuery.Event):
                     f"❌ **Amount Mismatch!** Aapne ₹{amount} ki request dali thi par SS me ₹{ss_amount} hai.\n\n"
                     "👉 **Kripya sahi amount ka real screenshot dobara send karein:**"
                 )
+                await log_auto_verify_failure(
+                    user_id, sender, amount,
+                    f"Amount mismatch (expected ₹{amount}, got ₹{ss_amount})",
+                    upi_txn_id
+                ) 
                 return
 
             if qr_gen_time and ss_date and ss_time:
@@ -1840,12 +2585,22 @@ async def callback_handler(event: events.CallbackQuery.Event):
                         "❌ **Invalid Screenshot Time!** Yeh screenshot scanner aane se pehle ka hai ya time match nahi hua (Purana SS).\n\n"
                         "👉 **Kripya naya payment karke uska fresh screenshot bhejien:**"
                     )
+                    await log_auto_verify_failure(
+                        user_id, sender, amount,
+                        "Old screenshot (before QR generation)",
+                        upi_txn_id
+                    ) 
                     return
             else:
                 state["state"] = "awaiting_deposit_ss"
                 await msg_wait.edit(
                     "❌ **Time Verification Failed!** Screenshot se payment ka time read nahi ho paya.\n\n"
                     "👉 **Kripya saaf screenshot dobara send karein:**"
+                )
+                await log_auto_verify_failure(
+                    user_id, sender, amount,
+                    "Time verification failed (could not parse)",
+                    upi_txn_id
                 )
                 return
 
@@ -1859,6 +2614,11 @@ async def callback_handler(event: events.CallbackQuery.Event):
                         f"❌ **Wrong Receiver UPI!** Yeh payment kisi aur ke UPI (`{ss_receiver}`) par bheja gaya hai, hamare UPI par nahi.\n\n"
                         "👉 **Kripya sahi UPI par payment karke uska naya screenshot send karein:**"
                     )
+                    await log_auto_verify_failure(
+                        user_id, sender, amount,
+                        f"Wrong receiver UPI (`{ss_receiver}`)",
+                        upi_txn_id
+                    )
                     return
 
             existing_txn = db["deposits"].find_one({"upi_txn_id": upi_txn_id if upi_txn_id else "NONE"})
@@ -1867,6 +2627,11 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 await msg_wait.edit(
                     "❌ **Duplicate Transaction ID!** Yeh UTR pehle hi use ho chuki hai.\n\n"
                     "👉 **Kripya naya screenshot dobara send karein:**"
+                )
+                await log_auto_verify_failure(
+                    user_id, sender, amount,
+                    "Duplicate UTR (already used)",
+                    upi_txn_id
                 )
                 return
 
@@ -1901,20 +2666,18 @@ async def callback_handler(event: events.CallbackQuery.Event):
             auto_date_str = now.strftime("%d-%m-%Y")
             auto_time_str = now.strftime("%I:%M:%S %p")
             approved_info = f"Automatic Bot at {auto_date_str} {auto_time_str}"
+            username_str_auto = f"@{sender.username}" if sender.username else "N/A"
             group_msg = (
                 f"🎉 **Payment Approved Successful (Auto)!**\n\n"
                 f"👤 **User:** {sender.first_name or 'User'}\n"
+                f"📛 **Username:** {username_str_auto}\n"
                 f"🆔 **User ID:** `{user_id}`\n"
                 f"💰 **Amount Added:** ₹{amount}\n"
                 f"🔢 **UPI Txn ID:** `{upi_txn_id or 'N/A'}`\n"
                 f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
-                f"🤖 **Approved By:** {approved_info}\n\n"
+                f"👑 **Approved By:** {approved_info}\n\n"
                 f"🤖 **Bot :** @DarktgOtp_bot\n"
             )
-            try:
-                await bot.send_message(PAYMENT_LOG_GROUP, group_msg)
-            except Exception as e:
-                print(f"Payment group log err: {e}")
             try:
                 await bot.send_message(OTP_GROUP_ID, group_msg)
             except Exception as e:
@@ -2043,11 +2806,21 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 
     elif data.startswith("buy_acc_"):
         target_phone = data.replace("buy_acc_", "")
+
+        # ✅ NAYA: Agar user ka koi session already hai toh purana cleanup karo (re-select ke liye)
+        if user_id in login_states:
+            old_sd = login_states[user_id]
+            old_phone = old_sd.get("account", {}).get("phone")
+            # Agar wahi number dobara select kar raha hai, toh purana disconnect karke naya start karo
+            if old_phone:
+                _busy_phones.discard(old_phone)
+            await cleanup_user_login(user_id)
+
         already_busy = any(s.get("account", {}).get("phone") == target_phone for s in login_states.values())
         if already_busy or target_phone in _busy_phones:
             await event.answer("⚠️ Yeh account abhi kisi aur user ne select kiya hai. Kuch der baad try karein.", alert=True)
             return
-        await cleanup_user_login(user_id)
+        
         acc = accounts_col.find_one({"phone": target_phone, "sold": False})
         if not acc:
             await event.answer("❌ Account no longer available!", alert=True)
@@ -2074,121 +2847,118 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 return
         login_states[user_id] = {
             "account": acc, "client": user_client,
-            "purchase_time": datetime.now().timestamp(), "is_logged_in": False
+            "purchase_time": datetime.now().timestamp(), "is_logged_in": False,
+            "last_msg_id": 0, "session_terminated": False
         }
+
+        # ✅ NAYA: Baseline capture karo (yaad rakho account select karte waqt kaun-kaun logged in hai)
+        try:
+            initial_sessions = await get_active_sessions_hash(user_client)
+            if initial_sessions is not None:
+                login_states[user_id]["baseline_sessions"] = initial_sessions
+                print(f"📸 [SESSION] Baseline captured at selection: {len(initial_sessions)} devices")
+        except Exception as e:
+            print(f"⚠️ [SESSION] Baseline capture failed: {e}")
+        
         owner_tag = " [👑 OWNER FREE ACCESS]" if is_owner else ""
-        await event.edit(
+        
+        # 👇 Yahan hum message ka ID save kar rahe hain
+        sent_msg = await event.edit(
             f"✅ **Account Selected!**{owner_tag}\n\n"
             f"📞 **Phone Number:** `{acc['phone']}`\n\n"
             f"👉 Login now in your Telegram app using this phone number.\n"
-            f"When code arrives, press the button below to fetch OTP.\n"
-            f"⏳ *Note: Aapke paas login karne ke liye 5 minute ka time hai.*",
+            f"⏳ *OTP aapko yahan automatically mil jayega (15 second ke andar). Kripya intezaar karein.*\n\n"
+            f"⚠️ *Agar account cancel karna hai, toh 'Back' dabayein. Aapka account delete nahi hoga, bas aap wapas list me chale jayenge.*",
             buttons=[
-                [styled_inline("📩 Request OTP / 2FA Code", b"fetch_otp", "success")],
-                [styled_inline("🔙 Back to Countries", b"buy_acc", "primary")]
+                [styled_inline("🔙 Back", b"buy_acc", "primary")]
             ]
         )
+        
+        login_states[user_id]["msg_id"] = sent_msg.id
 
     elif data == "fetch_otp":
         if user_id not in login_states:
             await event.answer("❌ Active session nahi mila. Kripya firse account select karein.", alert=True)
             return
+            
         session_data = login_states[user_id]
-        purchase_time = session_data.get("purchase_time", 0)
-        if datetime.now().timestamp() - purchase_time > 300:
-            await cleanup_user_login(user_id)
-            await event.answer("⏰ Time limit expired (5 mins)! Number stock me wapas chala gaya.", alert=True)
-            await event.edit("⏰ **Session Expired!** Aapne 5 minute ke andar login nahi kiya, isliye account stock me wapas bhej diya gaya hai.")
-            return
-        acc = session_data["account"]
-        user_client: TelegramClient = session_data["client"]
+        user_client = session_data.get("client")
+        
+        await event.answer("🔍 Checking messages...", alert=False)
+        
         try:
             if not user_client.is_connected():
                 await user_client.connect()
-        except Exception as conn_err:
-            await event.answer(f"❌ Session re-connection failed: {conn_err}", alert=True)
-            return
-        try:
-            otp_found = False
-            async for msg in user_client.iter_messages(777000, limit=5):
-                if not msg.text:
-                    continue
-                msg_ts = msg.date.timestamp() if msg.date else 0
-                if msg_ts < purchase_time:
-                    continue
-                otp_code = extract_otp(msg.text)
-                if otp_code != "NOT-FOUND":
-                    otp_found = True
-                    if not session_data.get("is_logged_in", False):
-                        if not is_owner:
-                            new_wallet = float(user.get("wallet", 0)) - float(acc["price"])
-                            users_col.update_one(
-                                {"user_id": int(user_id)},
-                                {"$set": {"wallet": new_wallet}, "$inc": {"total_spent": float(acc["price"])}}
-                            )
-                        accounts_col.update_one({"phone": acc["phone"]},
-                                                {"$set": {"sold": True, "buyer_id": int(user_id)}})
-                        session_data["is_logged_in"] = True
-                    two_fa = acc.get("2fa_password") or "None"
-                    masked_num = mask_phone_number(acc["phone"], acc.get('country_code'))
-                    await event.respond(
-                        f"📩 **Login Verification Code:**\n\n"
-                        f"📱 **Phone:** `{masked_num}`\n"
-                        f"🔑 **OTP:** `{otp_code}`\n"
-                        f"🔐 **2FA Password:** `{two_fa}`",
-                        buttons=logout_keyboard()
-                    )
-                    break
-            if not otp_found:
+                
+            last_msg_id = session_data.get("last_msg_id", 0)
+            # 👈 limit=5 karo taaki ek saath aaye toh sab process ho
+            messages = await user_client.get_messages(777000, limit=5, min_id=last_msg_id)
+            
+            if messages:
+                processed_any = False
+                for msg in reversed(messages):
+                    msg_ts = msg.date.timestamp() if msg.date else 0
+                    if msg_ts >= session_data.get("purchase_time", 0):
+                        session_data["last_msg_id"] = msg.id
+                        await process_telegram_message(user_id, msg, session_data)
+                        processed_any = True
+                
+                if not processed_any:
+                    await event.answer("❌ Naya OTP nahi mila! Kripya Telegram app me 'Send Code' par click karein.", alert=True)
+            else:
                 await event.answer("❌ Naya OTP nahi mila! Kripya Telegram app me 'Send Code' par click karein.", alert=True)
         except Exception as e:
-            print(f"OTP Fetch Error: {e}")
-            await event.answer("Error fetching OTP. Make sure you pressed 'Send Code' on Telegram app.", alert=True)
+            print(f"Fetch OTP Error: {e}")
+            await event.answer("Error fetching OTP.", alert=True)
 
     elif data == "customer_logout":
         if user_id in login_states:
             session_data = login_states[user_id]
-            if not session_data.get("is_logged_in", False):
-                await event.answer("❌ Aapne abhi tak new login verify nahi kiya hai!", alert=True)
-                return
             acc = session_data["account"]
             user_client = session_data["client"]
             masked_num = mask_phone_number(acc['phone'], acc.get('country_code'))
             user_mention = sender.first_name or "User"
             username_str = f"@{sender.username}" if sender.username else "N/A"
             acc_price = acc.get("price", 0.0)
-            me = await bot.get_me()
-            ref_link = f"https://t.me/{me.username}?start=REF{user_id}4F886"
-            group_msg = (
-                f"🎉 **New Purchase Successful**\n\n"
-                f"👤 **User:** {user_mention}\n"
-                f"📛 **Username:** {username_str}\n"
-                f"🆔 **User ID:** `{user_id}`\n"
-                f"📱 **Account Number:** `{masked_num}`\n"
-                f"💰 **Price:** ₹{acc_price}\n\n"
-                f"✨ **Thanks for purchase!**\n"
-                f"🔗 **Referral Link:** `{ref_link}`"
-            )
-            try:
-                await bot.send_message(OTP_GROUP_ID, group_msg, link_preview=False)
-            except Exception as ge:
-                print(f"Failed to send to OTP Group: {ge}")
-            for owner_id in OWNER_IDS:
+            
+            # ✅ Sirf tabhi group me purchase log jaye jab user actually login kar chuka ho
+            if session_data.get("is_logged_in", False):
+                me = await bot.get_me()
+                bot_username = me.username
+                group_msg = (
+                    f"🎉 **New Purchase Successful**\n\n"
+                    f"👤 **User:** {user_mention}\n"
+                    f"📛 **Username:** {username_str}\n"
+                    f"🆔 **User ID:** `{user_id}`\n"
+                    f"📱 **Account Number:** `{masked_num}`\n"
+                    f"💰 **Price:** ₹{acc_price}\n\n"
+                    f"✨ **Thanks for purchase!**\n\n"
+                    f"🤖 **Bot:** @{bot_username}"
+                )
                 try:
-                    await bot.send_message(owner_id,
-                        f"🔔 **Session Ended / Logout Alert**\n\n"
-                        f"👤 **User:** {user_mention}\n"
-                        f"📛 **Username:** {username_str}\n"
-                        f"🆔 **Customer ID:** `{user_id}`\n"
-                        f"📱 **Phone:** `{acc['phone']}`\n"
-                        f"Customer clicked logout from bot.")
-                except Exception as oe:
-                    print(f"Failed to send alert to owner {owner_id}: {oe}")
+                    await bot.send_message(OTP_GROUP_ID, group_msg, link_preview=False)
+                except Exception as ge:
+                    print(f"Failed to send to OTP Group: {ge}")
+                    
+                for owner_id in OWNER_IDS:
+                    try:
+                        await bot.send_message(owner_id,
+                            f"🔔 **Session Ended / Logout Alert**\n\n"
+                            f"👤 **User:** {user_mention}\n"
+                            f"📛 **Username:** {username_str}\n"
+                            f"🆔 **Customer ID:** `{user_id}`\n"
+                            f"📱 **Phone:** `{acc['phone']}`\n"
+                            f"Customer clicked logout from bot.")
+                    except Exception as oe:
+                        print(f"Failed to send alert to owner {owner_id}: {oe}")
+            
+            # Client ko disconnect karo (chahe login kiya ho ya nahi)
             try:
                 if user_client.is_connected():
                     await user_client.log_out()
             except Exception:
                 pass
+                
             del login_states[user_id]
             await event.edit("✅ You have logged out successfully from the session.")
         else:
@@ -2231,6 +3001,11 @@ async def callback_handler(event: events.CallbackQuery.Event):
                         f"💰 **You have received a 2% (₹{commission:.2f}) bonus in your wallet!**")
                 except Exception:
                     pass
+            now_ap = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+            approval_date_str_ap = now_ap.strftime("%d-%m-%Y")
+            approval_time_str_ap = now_ap.strftime("%I:%M:%S %p")
+            approved_by_info_ap = f"{sender.first_name or 'User'} at {approval_date_str_ap} {approval_time_str_ap}"
+            masked_sender_upi_ap = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
             log_group_msg = (
                 f"✅ **Deposit Approved Successfully**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -2238,7 +3013,8 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"🆔 **User ID:** `{target_user_id}`\n"
                 f"💰 **Approved Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Approved By:** {sender.first_name or 'User'}"
+                f"💳 **Customer UPI:** `{masked_sender_upi_ap}`\n"
+                f"👑 **Approved By:** {approved_by_info_ap}"
             )
             await event.edit(log_group_msg)
             user_msg = (
@@ -2268,10 +3044,6 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"🤖 **Bot :** @DarktgOtp_bot\n"
             )
             try:
-                await bot.send_message(PAYMENT_LOG_GROUP, group_approve_msg)
-            except Exception as e:
-                print(f"Failed to send approval to payment group: {e}")
-            try:
                 await bot.send_message(OTP_GROUP_ID, group_approve_msg)
             except Exception as e:
                 print(f"Failed to send approval to OTP group: {e}")
@@ -2280,6 +3052,10 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 {"user_id": target_user_id, "amount": amount, "status": "pending"},
                 {"$set": {"status": "rejected"}})
             masked_sender_upi = mask_upi_id(deposit_record.get("customer_upi")) if deposit_record else "N/A"
+            now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+            rejection_date_str = now.strftime("%d-%m-%Y")
+            rejection_time_str = now.strftime("%I:%M:%S %p")
+            rejected_by_info = f"{sender.first_name or 'User'} at {rejection_date_str} {rejection_time_str}"
             log_group_msg = (
                 f"❌ **Deposit Rejected**\n\n"
                 f"👤 **User:** {user_mention}\n"
@@ -2288,7 +3064,7 @@ async def callback_handler(event: events.CallbackQuery.Event):
                 f"💰 **Rejected Amount:** ₹{amount}\n"
                 f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
                 f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
-                f"👑 **Rejected By:** {sender.first_name or 'User'}"
+                f"👑 **Rejected By:** {rejected_by_info}"
             )
             await event.edit(log_group_msg)
             target_user_state = get_state(target_user_id)
@@ -2306,18 +3082,16 @@ async def callback_handler(event: events.CallbackQuery.Event):
             except Exception:
                 pass
             group_reject_msg = (
-                f"❌ **Payment Request Rejected!**\n\n"
+                f"❌ **Payment Rejected!**\n\n"
                 f"👤 **User:** {user_mention}\n"
                 f"📛 **Username:** {username_str}\n"
                 f"🆔 **User ID:** `{target_user_id}`\n"
-                f"💰 **Amount:** ₹{amount}\n"
-                f"🔢 **Txn ID / UTR:** `{txn_id}`\n"
-                f"👑 **Rejected By:** {sender.first_name or 'User'}"
+                f"💰 **Rejected Amount:** ₹{amount}\n"
+                f"🔢 **UPI Txn ID:** `{txn_id}`\n"
+                f"💳 **Customer UPI:** `{masked_sender_upi}`\n"
+                f"👑 **Rejected By:** {rejected_by_info}\n\n"
+                f"🤖 **Bot :** @DarktgOtp_bot\n"
             )
-            try:
-                await bot.send_message(PAYMENT_LOG_GROUP, group_reject_msg)
-            except Exception as e:
-                print(f"Failed to send rejection to payment group: {e}")
             try:
                 await bot.send_message(OTP_GROUP_ID, group_reject_msg)
             except Exception as e:
@@ -2421,9 +3195,23 @@ async def handle_text(event: events.NewMessage.Event):
         return
 
     elif text == "🛠️ Support":
-        support_keyboard = [[styled_url("💬 Contact Support", "https://t.me/ll_its_rudransh_ll", "danger")]]
-        await event.reply("🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:",
-                          buttons=support_keyboard)
+        usernames = get_support_usernames()
+        
+        # Agar list khaali hai toh bina button ke message bhejo
+        if not usernames:
+            await event.reply(
+                "🛠️ **Customer Support**\n\n❌ **Abhi koi Support available nahi hai.**\nKripya thodi der baad try karein."
+            )
+            return
+            
+        support_keyboard = []
+        for u in usernames:
+            support_keyboard.append([styled_url(f"💬 Contact @{u}", f"https://t.me/{u}", "danger")])
+            
+        await event.reply(
+            "🛠️ **Customer Support**\n\nFor any issues, contact Owner by clicking the button below:",
+            buttons=support_keyboard
+        )
         return
 
     # BULK OTP
@@ -2686,6 +3474,10 @@ async def main():
     print(f"MONGO_URI: {'SET' if MONGO_URI else 'MISSING'}")
     print("Connecting to Telegram...")
     await bot.start(bot_token=BOT_TOKEN)
+
+    asyncio.create_task(web_server())              # 👈 YE LINE ADD KARO
+    asyncio.create_task(background_message_checker())
+
     print("✅ Connected to Telegram!")
     me = await bot.get_me()
     print(f"✅ Bot username: @{me.username}")
