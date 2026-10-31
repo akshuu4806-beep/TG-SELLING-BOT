@@ -1,8 +1,15 @@
 .env
+.env.*
 *.session
 *.session-journal
 sessions/
 __pycache__/
 *.pyc
 *.pyo
-.python-version
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.log
+.DS_Store
