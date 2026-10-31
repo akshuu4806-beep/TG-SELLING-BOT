@@ -1,8 +1,10 @@
-telethon
-pymongo
 python-dotenv
-qrcode
+aiohttp
+qrcode[pil]
 pillow
 google-genai
 pycountry
-aiohttp
+telethon
+cryptg
+pymongo
+dnspython
